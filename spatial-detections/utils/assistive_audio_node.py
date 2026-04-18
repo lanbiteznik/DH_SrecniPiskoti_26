@@ -8,9 +8,9 @@ import numpy as np
 
 class AssistiveAudioNode(dai.node.HostNode):
     # Thresholds in mm
-    DANGER_MM = 800
-    WARN_MM   = 1500
-    CLEAR_MM  = 2000
+    DANGER_MM = 2500
+    WARN_MM   = 4000
+    CLEAR_MM  = 8000
 
     # Zone layout (row_frac_start, row_frac_end, col_frac_start, col_frac_end)
     # Cone: widest at bottom (ground row), narrowest at top — approximated as three stacked bands
@@ -142,7 +142,8 @@ class AssistiveAudioNode(dai.node.HostNode):
 
     def _speak(self, text: str) -> None:
         if self._tts_proc and self._tts_proc.poll() is None:
-            self._tts_proc.terminate()
+            #self._tts_proc.terminate()
+            return
         try:
             self._tts_proc = subprocess.Popen(
                 ["espeak-ng", "-s", "150", text],
