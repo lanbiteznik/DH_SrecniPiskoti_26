@@ -1,3 +1,5 @@
 .venv
 spatial-detections/.cache
 spatial-detections/.depthai_cached_models
+spatial-detections/media
+spatial-detections/utils/__pycache__
