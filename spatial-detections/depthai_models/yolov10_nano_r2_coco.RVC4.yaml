@@ -1,0 +1,2 @@
+model: luxonis/yolov10-nano:coco-512x288
+platform: RVC4
