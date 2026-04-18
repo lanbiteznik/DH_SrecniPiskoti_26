@@ -4,6 +4,28 @@ from depthai_nodes.utils import AnnotationHelper
 from typing import List
 import cv2
 
+# Cone trapezoid corners (col, row) — must match AssistiveAudioNode.ZONES geometry.
+# Narrow at the top (far away), wide at the bottom (close to camera/feet level).
+CONE_TL = (0.35, 0.10)  # top-left
+CONE_TR = (0.65, 0.10)  # top-right
+CONE_BR = (0.90, 0.90)  # bottom-right
+CONE_BL = (0.10, 0.90)  # bottom-left
+
+CONE_COLOR   = (1.0, 1.0, 0.0, 0.85)   # yellow outline
+CONE_FILL    = (1.0, 1.0, 0.0, 0.07)   # faint yellow fill
+DANGER_COLOR = (1.0, 0.0, 0.0, 1.0)    # red outline for obstacle in cone
+DANGER_FILL  = (1.0, 0.0, 0.0, 0.18)   # faint red fill
+
+
+def _in_cone(cx: float, cy: float) -> bool:
+    r0, r1 = CONE_TL[1], CONE_BL[1]
+    if not (r0 <= cy <= r1):
+        return False
+    t = (cy - r0) / (r1 - r0)
+    left  = CONE_TL[0] + t * (CONE_BL[0] - CONE_TL[0])
+    right = CONE_TR[0] + t * (CONE_BR[0] - CONE_TR[0])
+    return left <= cx <= right
+
 
 class AnnotationNode(dai.node.HostNode):
     def __init__(self) -> None:
@@ -40,18 +62,29 @@ class AnnotationNode(dai.node.HostNode):
 
         annotation_helper = AnnotationHelper()
 
-        for ix, detection in enumerate(detections_list):
+        # Draw the forward-path cone (trapezoid outline + faint fill)
+        annotation_helper.draw_polyline(
+            points=[CONE_TL, CONE_TR, CONE_BR, CONE_BL],
+            outline_color=CONE_COLOR,
+            fill_color=CONE_FILL,
+            thickness=2.0,
+            closed=True,
+        )
+
+        for detection in detections_list:
             xmin, ymin, xmax, ymax = (
                 detection.xmin,
                 detection.ymin,
                 detection.xmax,
                 detection.ymax,
             )
+            in_cone = _in_cone((xmin + xmax) / 2, (ymin + ymax) / 2)
+
             annotation_helper.draw_rectangle(
                 top_left=(xmin, ymin),
                 bottom_right=(xmax, ymax),
-                outline_color=PRIMARY_COLOR,
-                fill_color=TRANSPARENT_PRIMARY_COLOR,
+                outline_color=DANGER_COLOR if in_cone else PRIMARY_COLOR,
+                fill_color=DANGER_FILL if in_cone else TRANSPARENT_PRIMARY_COLOR,
                 thickness=2.0,
             )
 
