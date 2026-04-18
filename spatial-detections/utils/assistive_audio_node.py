@@ -8,18 +8,19 @@ import numpy as np
 
 class AssistiveAudioNode(dai.node.HostNode):
     # Thresholds in mm
-    DANGER_MM = 1500
-    WARN_MM   = 3000
-    CLEAR_MM  = 7000
+    DANGER_MM = 800
+    WARN_MM   = 1500
+    CLEAR_MM  = 2000
 
     # Zone layout (row_frac_start, row_frac_end, col_frac_start, col_frac_end)
-    # Image is H x W, top=0, left=0
+    # Cone: widest at bottom (ground row), narrowest at top — approximated as three stacked bands
+    # Left/right escape routes cover the same vertical range as the cone
     ZONES = {
-        "top":    (0.00, 0.33, 0.25, 0.75),  # center column, upper third
-        "center": (0.33, 0.67, 0.25, 0.75),  # center column, middle third
-        "bottom": (0.67, 1.00, 0.25, 0.75),  # center column, lower third
-        "left":   (0.25, 0.75, 0.00, 0.25),  # left quarter, mid-height     ← escape route
-        "right":  (0.25, 0.75, 0.75, 1.00),  # right quarter, mid-height    ← escape route
+        "cone_top":    (0.10, 0.40, 0.35, 0.65),  # narrow top of forward cone
+        "cone_mid":    (0.40, 0.65, 0.25, 0.75),  # middle band
+        "cone_bot":    (0.65, 0.90, 0.10, 0.90),  # wide base of cone (ground level)
+        "left":        (0.20, 0.80, 0.00, 0.25),  # left escape corridor
+        "right":       (0.20, 0.80, 0.75, 1.00),  # right escape corridor
     }
 
     def __init__(self) -> None:
@@ -40,32 +41,63 @@ class AssistiveAudioNode(dai.node.HostNode):
         if not frame.any():
             return
 
+        if not hasattr(self, "_sample_printed"):
+            self._sample_printed = True
+            self._print_sample(frame)
+
         dists = {name: self._zone_dist(frame, *fracs) for name, fracs in self.ZONES.items()}
+        cone_dist = min(dists["cone_top"], dists["cone_mid"], dists["cone_bot"])
 
         print(
-            f"\r  top={dists['top']/1000:.1f}m  center={dists['center']/1000:.1f}m"
-            f"  bottom={dists['bottom']/1000:.1f}m  left={dists['left']/1000:.1f}m"
-            f"  right={dists['right']/1000:.1f}m   ",
+            f"\r  cone={cone_dist/1000:.1f}m"
+            f"  left={dists['left']/1000:.1f}m  right={dists['right']/1000:.1f}m   ",
             end="", flush=True,
         )
 
-        new_state = self._classify(dists["center"])
+        new_state = self._classify(cone_dist)
         now = time.monotonic()
 
-        state_changed   = new_state != self._last_state
-        repeat_danger   = new_state == "danger" and now - self._last_spoken > self._interval
+        state_changed = new_state != self._last_state
+        repeat_alert  = new_state != "clear" and now - self._last_spoken > self._interval
 
-        if not (state_changed or repeat_danger):
+        if not (state_changed or repeat_alert):
             return
 
-        self._last_state  = new_state
-        msg = self._build_message(new_state, dists)
+        self._last_state = new_state
+        msg = self._build_message(new_state, cone_dist, dists)
         if msg is None:
             return
 
         self._last_spoken = now
         print(f"\n[AUDIO] {msg}")
         self._speak(msg)
+
+    def _print_sample(self, frame: np.ndarray) -> None:
+        H, W = frame.shape
+        valid = frame[frame > 0]
+        print(f"\n{'='*60}")
+        print(f"Frame shape: {frame.shape}  dtype: {frame.dtype}")
+        print(f"Valid pixels: {len(valid)}/{frame.size} ({100*len(valid)/frame.size:.1f}%)")
+        print(f"Depth range: {valid.min()}mm – {valid.max()}mm  median: {int(np.median(valid))}mm")
+        print()
+        # 8x16 downsampled grid (mm), 0=invalid
+        step_r, step_c = H // 8, W // 16
+        grid = frame[step_r//2::step_r, step_c//2::step_c][:8, :16]
+        print("Downsampled depth grid (mm), rows=top→bottom, cols=left→right:")
+        for row in grid:
+            print("  " + "  ".join(f"{v:5d}" if v > 0 else "    0" for v in row))
+        print()
+        # Per-zone raw stats
+        print("Zone stats (10th pct / median / valid%):")
+        for name, (r0, r1, c0, c1) in self.ZONES.items():
+            roi = frame[int(r0*H):int(r1*H), int(c0*W):int(c1*W)]
+            v = roi[roi > 0]
+            if len(v):
+                print(f"  {name:7s}: p10={int(np.percentile(v,10)):5d}mm  "
+                      f"median={int(np.median(v)):5d}mm  valid={100*len(v)/roi.size:.0f}%")
+            else:
+                print(f"  {name:7s}: no valid pixels")
+        print(f"{'='*60}\n")
 
     def _zone_dist(self, frame: np.ndarray, r0: float, r1: float, c0: float, c1: float) -> float:
         H, W = frame.shape
@@ -83,45 +115,34 @@ class AssistiveAudioNode(dai.node.HostNode):
             return "warn"
         return "clear"
 
-    def _build_message(self, state: str, dists: dict) -> Optional[str]:
+    def _build_message(self, state: str, cone_dist: float, dists: dict) -> Optional[str]:
         if state == "clear":
             return None
 
-        top_m    = dists["top"] / 1000
-        center_m = dists["center"] / 1000
-        bottom_m = dists["bottom"] / 1000
-
-        # Bottom obstacle closer than center/top → step or curb
-        bottom_hazard = (
-            dists["bottom"] < dists["center"] - 300
-            and dists["bottom"] < self.WARN_MM
-        )
-
         direction = self._escape_direction(dists["left"], dists["right"])
+        dist_m = cone_dist / 1000
 
         if state == "danger":
-            if bottom_hazard:
-                return f"Step or curb {bottom_m:.1f} meters. {direction}."
-            return f"Stop. Obstacle {center_m:.1f} meters. {direction}."
-
-        # warn state
-        if bottom_hazard:
-            return f"Low obstacle {bottom_m:.1f} meters ahead. {direction}."
-        if top_m < center_m - 300 and top_m < self.WARN_MM:
-            return f"High obstacle {top_m:.1f} meters ahead. {direction}."
-        return f"Obstacle {center_m:.1f} meters ahead. {direction}."
+            return f"Stop. Obstacle {dist_m:.1f} meters. {direction}."
+        return f"Obstacle {dist_m:.1f} meters ahead. {direction}."
 
     def _escape_direction(self, left_dist: float, right_dist: float) -> str:
         margin = 400  # mm — must be meaningfully clearer to recommend a side
+        left_clear  = left_dist  > self.WARN_MM
+        right_clear = right_dist > self.WARN_MM
+        if left_clear and (not right_clear or left_dist > right_dist + margin):
+            return "Move left"
+        if right_clear and (not left_clear or right_dist > left_dist + margin):
+            return "Move right"
         if left_dist > right_dist + margin:
             return "Move left"
         if right_dist > left_dist + margin:
             return "Move right"
-        return "Stop"
+        return "No clear path"
 
     def _speak(self, text: str) -> None:
         if self._tts_proc and self._tts_proc.poll() is None:
-            return
+            self._tts_proc.terminate()
         try:
             self._tts_proc = subprocess.Popen(
                 ["espeak-ng", "-s", "150", text],
