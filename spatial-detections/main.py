@@ -33,7 +33,7 @@ with dai.Pipeline(device) as pipeline:
 
     # detection model
     det_model_description = dai.NNModelDescription.fromYamlFile(
-        f"yolov6_nano_r2_coco.{platform}.yaml"
+        f"yolov10_nano_r2_coco.{platform}.yaml"
     )
     if det_model_description.model != args.model:
         det_model_description = dai.NNModelDescription(args.model, platform=platform)
