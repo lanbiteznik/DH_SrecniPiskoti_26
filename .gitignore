@@ -1,3 +1,56 @@
 .venv
 spatial-detections/.cache
 spatial-detections/.depthai_cached_models
+TEST_WEBSOCKET_SERVER.py
+TESTING_GUIDE.md
+.vscode/
+
+# Environment files with sensitive data
+.env
+front_vision_assistant/.env
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+*.iml
+
+# Android
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/google-services.json
+
+# iOS
+ios/.symlinks/
+ios/Pods/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Runner.xcworkspace/xcshareddata/
+*.mode1v3
+*.mode2v3
+*.moved-aside
+*.pbxuser
+*.perspectivev3
+
+# Web (keep web/ folder but ignore generated)
+web/flutter_service_worker.js
+
+# Environment & secrets
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Dependencies (restored with flutter pub get)
+.pub-cache/
+.pub/
