@@ -30,6 +30,8 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._last_state = "clear"
         self._last_spoken: float = 0.0
         self._tts_proc = None
+        self._smoothing_alpha = 0.25
+        self._smoothed_dists: dict[str, float] = {}
 
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
@@ -45,7 +47,10 @@ class AssistiveAudioNode(dai.node.HostNode):
             self._sample_printed = True
             self._print_sample(frame)
 
-        dists = {name: self._zone_dist(frame, *fracs) for name, fracs in self.ZONES.items()}
+        dists = {
+            name: self._smooth_distance(name, self._zone_dist(frame, *fracs))
+            for name, fracs in self.ZONES.items()
+        }
         cone_dist = min(dists["cone_top"], dists["cone_mid"], dists["cone_bot"])
 
         print(
@@ -108,6 +113,19 @@ class AssistiveAudioNode(dai.node.HostNode):
         # 10th percentile: robust closest obstacle, ignores noise
         return float(np.percentile(valid, 10))
 
+    def _smooth_distance(self, zone: str, new_value: float) -> float:
+        previous_value = self._smoothed_dists.get(zone)
+        if previous_value is None:
+            self._smoothed_dists[zone] = new_value
+            return new_value
+
+        smoothed_value = (
+            self._smoothing_alpha * new_value
+            + (1.0 - self._smoothing_alpha) * previous_value
+        )
+        self._smoothed_dists[zone] = smoothed_value
+        return smoothed_value
+
     def _classify(self, path_dist: float) -> str:
         if path_dist <= self.DANGER_MM:
             return "danger"
@@ -123,8 +141,10 @@ class AssistiveAudioNode(dai.node.HostNode):
         dist_m = cone_dist / 1000
 
         if state == "danger":
-            return f"Stop. Obstacle {dist_m:.1f} meters. {direction}."
-        return f"Obstacle {dist_m:.1f} meters ahead. {direction}."
+            #return f"Stop. Obstacle {dist_m:.1f} meters. {direction}."
+            return f"Stop. Obstacle. {direction}."
+        #return f"Obstacle {dist_m:.1f} meters ahead. {direction}."
+        return f"Obstacle ahead. {direction}."
 
     def _escape_direction(self, left_dist: float, right_dist: float) -> str:
         margin = 400  # mm — must be meaningfully clearer to recommend a side
