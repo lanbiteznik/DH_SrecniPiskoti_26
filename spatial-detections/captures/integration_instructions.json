@@ -1,0 +1,185 @@
+{
+  "total_instructions": 12,
+  "instructions": [
+    {
+      "frame_id": 0,
+      "instruction": "Detected person at middle center (close, 1.50m away) with 95% confidence",
+      "target_label": "person",
+      "confidence": 0.95,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 1.5,
+        "distance_category": "close",
+        "x_mm": 50.0,
+        "y_mm": -10.0,
+        "z_mm": 1500.0
+      }
+    },
+    {
+      "frame_id": 1,
+      "instruction": "Detected person at top left (close, 1.20m away) with 92% confidence",
+      "target_label": "person",
+      "confidence": 0.92,
+      "spatial_info": {
+        "horizontal": "left",
+        "vertical": "top",
+        "distance_meters": 1.2,
+        "distance_category": "close",
+        "x_mm": -200.0,
+        "y_mm": -150.0,
+        "z_mm": 1200.0
+      }
+    },
+    {
+      "frame_id": 1,
+      "instruction": "Detected car at middle center (medium distance, 2.50m away) with 88% confidence",
+      "target_label": "car",
+      "confidence": 0.88,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 2.5,
+        "distance_category": "medium distance",
+        "x_mm": 20.0,
+        "y_mm": -5.0,
+        "z_mm": 2500.0
+      }
+    },
+    {
+      "frame_id": 1,
+      "instruction": "Detected traffic light at top right (very close, 0.80m away) with 85% confidence",
+      "target_label": "traffic light",
+      "confidence": 0.85,
+      "spatial_info": {
+        "horizontal": "right",
+        "vertical": "top",
+        "distance_meters": 0.8,
+        "distance_category": "very close",
+        "x_mm": 350.0,
+        "y_mm": -200.0,
+        "z_mm": 800.0
+      }
+    },
+    {
+      "frame_id": 2,
+      "instruction": "Detected person at middle center (very close, 0.30m away) with 97% confidence",
+      "target_label": "person",
+      "confidence": 0.97,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 0.3,
+        "distance_category": "very close",
+        "x_mm": 150.0,
+        "y_mm": 50.0,
+        "z_mm": 300.0
+      }
+    },
+    {
+      "frame_id": 3,
+      "instruction": "Detected car at middle center (far, 8.50m away) with 76% confidence",
+      "target_label": "car",
+      "confidence": 0.76,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 8.5,
+        "distance_category": "far",
+        "x_mm": 5.0,
+        "y_mm": -2.0,
+        "z_mm": 8500.0
+      }
+    },
+    {
+      "frame_id": 5,
+      "instruction": "Detected person at middle center (close, 1.50m away) with 95% confidence",
+      "target_label": "person",
+      "confidence": 0.95,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 1.5,
+        "distance_category": "close",
+        "x_mm": 50.0,
+        "y_mm": -10.0,
+        "z_mm": 1500.0
+      }
+    },
+    {
+      "frame_id": 6,
+      "instruction": "Detected person at top left (close, 1.20m away) with 92% confidence",
+      "target_label": "person",
+      "confidence": 0.92,
+      "spatial_info": {
+        "horizontal": "left",
+        "vertical": "top",
+        "distance_meters": 1.2,
+        "distance_category": "close",
+        "x_mm": -200.0,
+        "y_mm": -150.0,
+        "z_mm": 1200.0
+      }
+    },
+    {
+      "frame_id": 6,
+      "instruction": "Detected car at middle center (medium distance, 2.50m away) with 88% confidence",
+      "target_label": "car",
+      "confidence": 0.88,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 2.5,
+        "distance_category": "medium distance",
+        "x_mm": 20.0,
+        "y_mm": -5.0,
+        "z_mm": 2500.0
+      }
+    },
+    {
+      "frame_id": 6,
+      "instruction": "Detected traffic light at top right (very close, 0.80m away) with 85% confidence",
+      "target_label": "traffic light",
+      "confidence": 0.85,
+      "spatial_info": {
+        "horizontal": "right",
+        "vertical": "top",
+        "distance_meters": 0.8,
+        "distance_category": "very close",
+        "x_mm": 350.0,
+        "y_mm": -200.0,
+        "z_mm": 800.0
+      }
+    },
+    {
+      "frame_id": 7,
+      "instruction": "Detected person at middle center (very close, 0.30m away) with 97% confidence",
+      "target_label": "person",
+      "confidence": 0.97,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 0.3,
+        "distance_category": "very close",
+        "x_mm": 150.0,
+        "y_mm": 50.0,
+        "z_mm": 300.0
+      }
+    },
+    {
+      "frame_id": 8,
+      "instruction": "Detected car at middle center (far, 8.50m away) with 76% confidence",
+      "target_label": "car",
+      "confidence": 0.76,
+      "spatial_info": {
+        "horizontal": "center",
+        "vertical": "middle",
+        "distance_meters": 8.5,
+        "distance_category": "far",
+        "x_mm": 5.0,
+        "y_mm": -2.0,
+        "z_mm": 8500.0
+      }
+    }
+  ]
+}

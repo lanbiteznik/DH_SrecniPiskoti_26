@@ -4,6 +4,8 @@ from depthai_nodes.node import ApplyColormap
 from utils.arguments import initialize_argparser
 from utils.annotation_node import AnnotationNode
 from utils.assistive_audio_node import AssistiveAudioNode
+from utils.capture_service import CaptureService
+from utils.vocal_instruction_service import VocalInstructionService
 
 _, args = initialize_argparser()
 
@@ -27,6 +29,14 @@ if len(available_cameras) < 3:
     raise ValueError(
         "Device must have 3 cameras (color, left and right) in order to run this example."
     )
+
+# Initialize capture service for data export
+capture_service = CaptureService(export_dir="./captures")
+print(f"Capture service initialized. Data will be saved to {capture_service.export_dir}")
+
+# Initialize vocal instruction service
+vocal_service = VocalInstructionService(capture_service)
+print("Vocal instruction service initialized")
 
 with dai.Pipeline(device) as pipeline:
     print("Creating pipeline...")
@@ -113,14 +123,28 @@ with dai.Pipeline(device) as pipeline:
     visualizer.addTopic("Detections", annotation_node.out_annotations)
     visualizer.addTopic("Depth", depth_encoder.out)
 
+    # Output queue for detections to feed to capture service
+    detection_queue = pipeline.createOutputQueue(nn.out, maxSize=4, blocking=False)
+
     print("Pipeline created.")
 
     pipeline.start()
     visualizer.registerPipeline(pipeline)
 
     while pipeline.isRunning():
+        # Capture and process detections
+        detections = detection_queue.tryGet()
+        if detections is not None:
+            # Feed detection data to capture service
+            capture_service.add_detection(detections, classes, nn_size[0], nn_size[1])
+            print(f"Frame {capture_service.frame_id}: {len(detections.detections)} detections")
+
         key = visualizer.waitKey(1)
         if key == ord("q"):
             print("Got q key. Exiting...")
             break
+    
+    # Export captured data on exit
+    capture_service.export_json()
+    capture_service.export_jsonl()
             
