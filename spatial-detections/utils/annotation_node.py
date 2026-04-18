@@ -4,17 +4,29 @@ from depthai_nodes.utils import AnnotationHelper
 from typing import List
 import cv2
 
-# Cone trapezoid corners (col, row) — must match AssistiveAudioNode.ZONES geometry.
-# Narrow at the top (far away), wide at the bottom (close to camera/feet level).
-CONE_TL = (0.35, 0.10)  # top-left
-CONE_TR = (0.65, 0.10)  # top-right
-CONE_BR = (0.90, 0.90)  # bottom-right
-CONE_BL = (0.10, 0.90)  # bottom-left
+from .zones import (
+    ZONES, CONE_TL, CONE_TR, CONE_BR, CONE_BL,
+    DANGER_MM, WARN_MM, zone_dist, classify,
+)
 
-CONE_COLOR   = (1.0, 1.0, 0.0, 0.85)   # yellow outline
-CONE_FILL    = (1.0, 1.0, 0.0, 0.07)   # faint yellow fill
-DANGER_COLOR = (1.0, 0.0, 0.0, 1.0)    # red outline for obstacle in cone
-DANGER_FILL  = (1.0, 0.0, 0.0, 0.18)   # faint red fill
+# Colors: (R, G, B, A)
+CONE_OUTLINE     = (1.0, 1.0, 0.0, 0.9)
+CONE_FILL        = (1.0, 1.0, 0.0, 0.06)
+DANGER_OUTLINE   = (1.0, 0.0, 0.0, 1.0)
+DANGER_FILL      = (1.0, 0.0, 0.0, 0.20)
+WARN_OUTLINE     = (1.0, 0.55, 0.0, 1.0)
+WARN_FILL        = (1.0, 0.55, 0.0, 0.14)
+CLEAR_OUTLINE    = (0.0, 1.0, 0.3, 0.7)
+CLEAR_FILL       = (0.0, 1.0, 0.3, 0.05)
+
+STATE_COLORS = {
+    "danger": (DANGER_OUTLINE, DANGER_FILL),
+    "warn":   (WARN_OUTLINE,   WARN_FILL),
+    "clear":  (CLEAR_OUTLINE,  CLEAR_FILL),
+}
+
+# Only show zone overlays for the cone bands (not escape corridors — too cluttered)
+CONE_ZONES = ("cone_top", "cone_mid", "cone_bot")
 
 
 def _in_cone(cx: float, cy: float) -> bool:
@@ -58,19 +70,62 @@ class AnnotationNode(dai.node.HostNode):
     ) -> None:
         assert isinstance(detections_message, dai.SpatialImgDetections)
 
-        detections_list: List[dai.SpatialImgDetection] = detections_message.detections
+        depth_frame = depth_message.getCvFrame()
+        dists = {name: zone_dist(depth_frame, *fracs) for name, fracs in ZONES.items()}
 
         annotation_helper = AnnotationHelper()
 
-        # Draw the forward-path cone (trapezoid outline + faint fill)
+        # Draw cone zone bands, colored by their danger state
+        for name in CONE_ZONES:
+            r0, r1, c0, c1 = ZONES[name]
+            d = dists[name]
+            state = classify(d)
+            outline, fill = STATE_COLORS[state]
+            annotation_helper.draw_rectangle(
+                top_left=(c0, r0),
+                bottom_right=(c1, r1),
+                outline_color=outline,
+                fill_color=fill,
+                thickness=1.5,
+            )
+            annotation_helper.draw_text(
+                text=f"{d/1000:.1f}m",
+                position=(c0 + 0.01, r0 + 0.04),
+                size=11,
+                color=outline,
+            )
+
+        # Draw the overall cone trapezoid outline (yellow) on top
         annotation_helper.draw_polyline(
             points=[CONE_TL, CONE_TR, CONE_BR, CONE_BL],
-            outline_color=CONE_COLOR,
+            outline_color=CONE_OUTLINE,
             fill_color=CONE_FILL,
             thickness=2.0,
             closed=True,
         )
 
+        # Draw escape corridor states
+        for side in ("left", "right"):
+            r0, r1, c0, c1 = ZONES[side]
+            d = dists[side]
+            state = classify(d)
+            outline, fill = STATE_COLORS[state]
+            annotation_helper.draw_rectangle(
+                top_left=(c0, r0),
+                bottom_right=(c1, r1),
+                outline_color=outline,
+                fill_color=fill,
+                thickness=1.5,
+            )
+            annotation_helper.draw_text(
+                text=f"{d/1000:.1f}m",
+                position=(c0 + 0.01, r0 + 0.04),
+                size=11,
+                color=outline,
+            )
+
+        # Draw detections — red if inside the cone, default color otherwise
+        detections_list: List[dai.SpatialImgDetection] = detections_message.detections
         for detection in detections_list:
             xmin, ymin, xmax, ymax = (
                 detection.xmin,
@@ -83,11 +138,10 @@ class AnnotationNode(dai.node.HostNode):
             annotation_helper.draw_rectangle(
                 top_left=(xmin, ymin),
                 bottom_right=(xmax, ymax),
-                outline_color=DANGER_COLOR if in_cone else PRIMARY_COLOR,
+                outline_color=DANGER_OUTLINE if in_cone else PRIMARY_COLOR,
                 fill_color=DANGER_FILL if in_cone else TRANSPARENT_PRIMARY_COLOR,
                 thickness=2.0,
             )
-
             annotation_helper.draw_text(
                 text=f"{self.labels[detection.label]} {int(detection.confidence * 100)}% \nx: {detection.spatialCoordinates.x:.2f}mm \ny: {detection.spatialCoordinates.y:.2f}mm \nz:{detection.spatialCoordinates.z:.2f}mm",
                 position=(xmin + 0.01, ymin + 0.2),
@@ -105,10 +159,10 @@ class AnnotationNode(dai.node.HostNode):
             cv2.convertScaleAbs(depth_map, alpha=0.3), cv2.COLORMAP_JET
         )
 
-        depth_frame = dai.ImgFrame()
-        depth_frame.setCvFrame(depth_map, dai.ImgFrame.Type.BGR888i)
-        depth_frame.setTimestamp(depth_message.getTimestamp())
-        depth_frame.setSequenceNum(depth_message.getSequenceNum())
+        out_frame = dai.ImgFrame()
+        out_frame.setCvFrame(depth_map, dai.ImgFrame.Type.BGR888i)
+        out_frame.setTimestamp(depth_message.getTimestamp())
+        out_frame.setSequenceNum(depth_message.getSequenceNum())
 
         self.out_annotations.send(annotations)
-        self.out_depth.send(depth_frame)
+        self.out_depth.send(out_frame)
