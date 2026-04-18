@@ -26,6 +26,9 @@ class AssistiveAudioNode(dai.node.HostNode):
     SIDE_MARGIN_MM = 500
     SIDE_STRONG_MARGIN_MM = 700
 
+    # Extra margin required to flip direction shortly after speaking
+    DIRECTION_FLIP_EXTRA_MARGIN_MM = 400
+
     # Minimum occupied fraction of valid ROI pixels under WARN distance
     # required to consider a zone genuinely blocked
     OCCUPANCY_THRESHOLD = 0.12
@@ -42,10 +45,10 @@ class AssistiveAudioNode(dai.node.HostNode):
     # Speech cooldowns
     COOLDOWN_SECONDS = {
         "STOP": 0.0,
-        "STEP_LEFT": 1.0,
-        "STEP_RIGHT": 1.0,
-        "WAIT": 1.5,
-        "FORWARD": 2.0,
+        "STEP_LEFT": 1.5,
+        "STEP_RIGHT": 1.5,
+        "WAIT": 2.0,
+        "FORWARD": 3.0,
     }
 
     # Spoken phrases
@@ -81,6 +84,7 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         self._interval = 2.0
         self._tts_proc = None
+        self._tts_priority = 0
 
         self._smoothing_alpha = 0.25
         self._smoothed_dists: dict[str, float] = {}
@@ -91,6 +95,10 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         self._candidate_command: Optional[str] = None
         self._candidate_since: float = 0.0
+
+        # Anti-spam controls
+        self._refractory_until: float = 0.0
+        self._last_nonstop_command: Optional[str] = None
 
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
@@ -145,15 +153,17 @@ class AssistiveAudioNode(dai.node.HostNode):
         if now - self._candidate_since < confirm_seconds:
             return
 
-        # Suppress repeats unless cooldown expired
-        if candidate == self._last_command:
-            cooldown = self.COOLDOWN_SECONDS.get(candidate, self._interval)
-            if now - self._last_spoken < cooldown:
-                return
+        if not self._should_speak(candidate, now):
+            return
 
         # Speak confirmed command
         self._last_command = candidate
         self._last_spoken = now
+
+        if candidate != "STOP":
+            self._last_nonstop_command = candidate
+            self._refractory_until = now + 1.2
+
         spoken = self.COMMAND_TEXT[candidate]
         print(f"\n[AUDIO] {spoken}")
         self._speak(spoken, priority=self.COMMAND_PRIORITY[candidate])
@@ -287,7 +297,7 @@ class AssistiveAudioNode(dai.node.HostNode):
         if state == "warn":
             return self._pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=False)
 
-        # Clear path recovery
+        # Clear path recovery only
         if (
             cone_top > self.CLEAR_MM
             and cone_mid > self.CLEAR_MM
@@ -307,6 +317,23 @@ class AssistiveAudioNode(dai.node.HostNode):
     ) -> str:
         margin = self.SIDE_STRONG_MARGIN_MM if strong else self.SIDE_MARGIN_MM
 
+        # Add stickiness: don't flip directions too easily right after speaking one
+        recent_direction = (
+            self._last_command in {"STEP_LEFT", "STEP_RIGHT"}
+            and (time.monotonic() - self._last_spoken) < 1.5
+        )
+
+        if recent_direction:
+            if self._last_command == "STEP_LEFT":
+                if right_dist > left_dist + margin + self.DIRECTION_FLIP_EXTRA_MARGIN_MM:
+                    return "STEP_RIGHT"
+                return "STEP_LEFT" if not left_blocked or left_dist >= right_dist - margin else ("STOP" if strong else "WAIT")
+
+            if self._last_command == "STEP_RIGHT":
+                if left_dist > right_dist + margin + self.DIRECTION_FLIP_EXTRA_MARGIN_MM:
+                    return "STEP_LEFT"
+                return "STEP_RIGHT" if not right_blocked or right_dist >= left_dist - margin else ("STOP" if strong else "WAIT")
+
         # Strong preference for a genuinely clear side
         if not left_blocked and (right_blocked or left_dist > right_dist + margin):
             return "STEP_LEFT"
@@ -322,6 +349,43 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         # No reliable escape route
         return "STOP" if strong else "WAIT"
+
+    def _should_speak(self, candidate: str, now: float) -> bool:
+        # STOP can always break through
+        if candidate == "STOP":
+            return True
+
+        # Refractory window suppresses non-urgent chatter
+        if now < self._refractory_until:
+            return False
+
+        # Same command -> obey cooldown
+        if candidate == self._last_command:
+            cooldown = self.COOLDOWN_SECONDS.get(candidate, self._interval)
+            return (now - self._last_spoken) >= cooldown
+
+        last_priority = self.COMMAND_PRIORITY.get(self._last_command, 0) if self._last_command else 0
+        new_priority = self.COMMAND_PRIORITY.get(candidate, 0)
+
+        # Avoid immediate downgrade after stronger command
+        if new_priority < last_priority and (now - self._last_spoken) < 1.2:
+            return False
+
+        # Don't flip directions too quickly
+        if self._last_command == "STEP_LEFT" and candidate == "STEP_RIGHT":
+            if (now - self._last_spoken) < 1.5:
+                return False
+
+        if self._last_command == "STEP_RIGHT" and candidate == "STEP_LEFT":
+            if (now - self._last_spoken) < 1.5:
+                return False
+
+        # FORWARD should only be spoken as recovery from a blocked state
+        if candidate == "FORWARD":
+            if self._last_command not in {"STOP", "WAIT", "STEP_LEFT", "STEP_RIGHT"}:
+                return False
+
+        return True
 
     def _debug_print(
         self,
@@ -343,7 +407,8 @@ class AssistiveAudioNode(dai.node.HostNode):
             f"occL={zone_metrics['left']['occupied_ratio']:.2f} "
             f"occR={zone_metrics['right']['occupied_ratio']:.2f} "
             f"state={self._last_state} "
-            f"cand={candidate or '-'}     ",
+            f"cand={candidate or '-'} "
+            f"last={self._last_command or '-'}     ",
             end="",
             flush=True,
         )
