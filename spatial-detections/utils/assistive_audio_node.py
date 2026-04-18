@@ -1,76 +1,65 @@
 import subprocess
 import time
-from typing import List, Optional
+from typing import Optional
 
 import depthai as dai
 import numpy as np
 
 
 class AssistiveAudioNode(dai.node.HostNode):
-    # Distance thresholds in mm
-    CLEAR_MM = 4000    # beyond this: path is clear, stay silent
-    WARN_MM = 2000     # warn zone: obstacle detected, suggest direction
-    DANGER_MM = 1200    # danger zone: very close, urgent
-    IGNORE_MM = 800     # ignore anything closer than this (could be noise)
+    # Thresholds in mm
+    DANGER_MM = 800
+    WARN_MM   = 1500
+    CLEAR_MM  = 2000
+
+    # Zone layout (row_frac_start, row_frac_end, col_frac_start, col_frac_end)
+    # Image is H x W, top=0, left=0
+    ZONES = {
+        "head":   (0.00, 0.33, 0.25, 0.75),  # center column, upper third
+        "path":   (0.33, 0.67, 0.25, 0.75),  # center column, middle third  ← main walking corridor
+        "ground": (0.67, 1.00, 0.25, 0.75),  # center column, lower third   ← steps / curbs
+        "left":   (0.25, 0.75, 0.00, 0.25),  # left quarter, mid-height     ← escape route
+        "right":  (0.25, 0.75, 0.75, 1.00),  # right quarter, mid-height    ← escape route
+    }
 
     def __init__(self) -> None:
         super().__init__()
         self.input_depth = self.createInput()
-        self._interval: float = 2.0
+        self._interval   = 2.0
+        self._last_state = "clear"
         self._last_spoken: float = 0.0
-        self._last_state: str = "clear"
         self._tts_proc = None
-        self._debug_printed: bool = False
 
-    def build(
-        self,
-        depth: dai.Node.Output,
-        interval: float = 2.0,
-    ) -> "AssistiveAudioNode":
+    def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
         self.link_args(depth)
         return self
 
     def process(self, depth_message: dai.ImgFrame) -> None:
-        frame = depth_message.getCvFrame()  # H x W, uint16, values in mm
+        frame = depth_message.getCvFrame()          # (H, W) uint16, mm
+        if not frame.any():
+            return
 
-        if not self._debug_printed:
-            valid = frame[frame > 0]
-            if len(valid) == 0:
-                return  # wait for a real frame
-            self._debug_printed = True
-            print(f"\n{'='*50}")
-            print(f"Depth frame shape : {frame.shape}  dtype={frame.dtype}")
-            print(f"Valid pixels      : {len(valid)} / {frame.size} ({100*len(valid)/frame.size:.1f}%)")
-            print(f"Valid range       : {valid.min():.0f}mm – {valid.max():.0f}mm")
-            print(f"Valid median      : {np.median(valid):.0f}mm ({np.median(valid)/1000:.2f}m)")
-            print(f"Sample row (center, every 20px): {frame[frame.shape[0]//2, ::20].tolist()}")
-            print(f"{'='*50}\n")
-
-        H, W = frame.shape
-        # Focus on the lower 2/3 of the frame (torso/floor level obstacles)
-        roi = frame[H // 3 :, :]
-
-        left_dist = self._zone_dist(roi[:, : W // 3])
-        center_dist = self._zone_dist(roi[:, W // 3 : 2 * W // 3])
-        right_dist = self._zone_dist(roi[:, 2 * W // 3 :])
+        dists = {name: self._zone_dist(frame, *fracs) for name, fracs in self.ZONES.items()}
 
         print(
-            f"\r  depth zones — left: {left_dist/1000:.1f}m  center: {center_dist/1000:.1f}m  right: {right_dist/1000:.1f}m   ",
-            end="",
-            flush=True,
+            f"\r  path={dists['path']/1000:.1f}m  ground={dists['ground']/1000:.1f}m"
+            f"  head={dists['head']/1000:.1f}m  left={dists['left']/1000:.1f}m"
+            f"  right={dists['right']/1000:.1f}m   ",
+            end="", flush=True,
         )
 
-        new_state = self._classify(center_dist)
+        new_state = self._classify(dists["path"])
         now = time.monotonic()
 
-        state_changed = new_state != self._last_state
-        repeat_danger = new_state == "danger" and now - self._last_spoken > self._interval
+        state_changed   = new_state != self._last_state
+        repeat_danger   = new_state == "danger" and now - self._last_spoken > self._interval
+
         if not (state_changed or repeat_danger):
             return
 
-        self._last_state = new_state
-        msg = self._build_message(new_state, center_dist, left_dist, right_dist)
+        self._last_state  = new_state
+        msg = self._build_message(new_state, dists)
         if msg is None:
             return
 
@@ -78,35 +67,49 @@ class AssistiveAudioNode(dai.node.HostNode):
         print(f"\n[AUDIO] {msg}")
         self._speak(msg)
 
-    def _zone_dist(self, zone: np.ndarray) -> float:
-        valid = zone[zone > 0]
+    def _zone_dist(self, frame: np.ndarray, r0: float, r1: float, c0: float, c1: float) -> float:
+        H, W = frame.shape
+        roi  = frame[int(r0*H):int(r1*H), int(c0*W):int(c1*W)]
+        valid = roi[roi > 0]
         if len(valid) == 0:
             return float(self.CLEAR_MM * 2)
-        # 10th percentile: robust closest-obstacle estimate, ignores noise
+        # 10th percentile: robust closest obstacle, ignores noise
         return float(np.percentile(valid, 10))
 
-    def _classify(self, center_dist: float) -> str:
-        if center_dist <= self.DANGER_MM:
+    def _classify(self, path_dist: float) -> str:
+        if path_dist <= self.DANGER_MM:
             return "danger"
-        if center_dist <= self.WARN_MM:
+        if path_dist <= self.WARN_MM:
             return "warn"
         return "clear"
 
-    def _build_message(
-        self, state: str, center_dist: float, left_dist: float, right_dist: float
-    ) -> Optional[str]:
+    def _build_message(self, state: str, dists: dict) -> Optional[str]:
         if state == "clear":
-            return None  # path is clear — stay silent
+            return None
 
-        meters = center_dist / 1000.0
-        direction = self._suggest_direction(left_dist, right_dist)
+        path_m   = dists["path"]   / 1000
+        ground_m = dists["ground"] / 1000
+
+        # Ground-level obstacle closer than path-level → step or curb
+        ground_hazard = (
+            dists["ground"] < dists["path"] - 300
+            and dists["ground"] < self.WARN_MM
+        )
+
+        direction = self._escape_direction(dists["left"], dists["right"])
 
         if state == "danger":
-            return f"Stop. Obstacle {meters:.1f} meters. {direction}."
-        return f"Obstacle ahead, {meters:.1f} meters. {direction}."
+            if ground_hazard:
+                return f"Step or curb {ground_m:.1f} meters. {direction}."
+            return f"Stop. Obstacle {path_m:.1f} meters. {direction}."
 
-    def _suggest_direction(self, left_dist: float, right_dist: float) -> str:
-        margin = 300  # mm — minimum advantage to recommend a side
+        # warn state
+        if ground_hazard:
+            return f"Low obstacle {ground_m:.1f} meters ahead. {direction}."
+        return f"Obstacle {path_m:.1f} meters ahead. {direction}."
+
+    def _escape_direction(self, left_dist: float, right_dist: float) -> str:
+        margin = 400  # mm — must be meaningfully clearer to recommend a side
         if left_dist > right_dist + margin:
             return "Move left"
         if right_dist > left_dist + margin:
