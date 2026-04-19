@@ -1,21 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'tts/tts_factory.dart';
+import 'stt_service.dart';
 import 'config.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Load environment variables from .env file
-  await dotenv.load(fileName: '.env');
-
-  if (AppConfig.debugLogging) {
-    print(AppConfig.getStatus());
-  }
-
   runApp(const VisionAssistantApp());
 }
 
@@ -39,25 +31,35 @@ class VisionScreen extends StatefulWidget {
 }
 
 class _VisionScreenState extends State<VisionScreen> {
+  // ── services ──────────────────────────────────────────────
   late WebSocketChannel _channel;
   final TtsService _tts = TtsService();
-  final StreamController<Map<String, dynamic>> _queue = StreamController();
+  final SttService _stt = SttService();
 
-  int _lastSpokenMs = 0;
-  String _lastPhrase = '';
-  bool _isSpeaking = false;
+  // ── app state ─────────────────────────────────────────────
   bool _ready = false;
   bool _started = false;
   String _status = 'Initializing...';
   String _lastDetection = '';
 
-  // Update per environment:
-  // Android emulator : ws://10.0.2.2:8001/ws
-  // iOS simulator    : ws://127.0.0.1:8001/ws
-  // Web (local)      : ws://localhost:8001/ws
-  // Real device      : ws://192.168.X.X:8001/ws
+  // ── mic state (single flag) ────────────────────────────────
+  bool _micActive = false;
+  bool _isListening = false; // UI only
 
-  static String get _wsUrl => AppConfig.websocketUrl;
+  // ── queue ─────────────────────────────────────────────────
+  // Each item: { 'phrase': String, 'priority': bool }
+  final List<Map<String, dynamic>> _queue = [];
+  bool _queueRunning = false;
+  bool _isSpeaking = false;
+
+  // ── warning dedup ─────────────────────────────────────────
+  // Only used in _onMessage to avoid flooding the queue
+  String _lastQueuedPhrase = '';
+  int _lastQueuedMs = 0;
+
+  static const _wsUrl = 'ws://localhost:8001/ws';
+
+  // ── lifecycle ─────────────────────────────────────────────
 
   @override
   void initState() {
@@ -67,15 +69,30 @@ class _VisionScreenState extends State<VisionScreen> {
 
   Future<void> _init() async {
     try {
+      await AppConfig.load();
       await _tts.init();
-      if (mounted) setState(() => _status = 'Ready');
+      await _stt.init();
       _connect();
-      _processQueue();
-      if (mounted) setState(() => _ready = true);
+      _startQueueLoop();
+      if (mounted)
+        setState(() {
+          _status = 'Ready';
+          _ready = true;
+        });
     } catch (e) {
       if (mounted) setState(() => _status = 'Init error: $e');
     }
   }
+
+  @override
+  void dispose() {
+    _channel.sink.close();
+    _tts.stop();
+    _stt.stop();
+    super.dispose();
+  }
+
+  // ── websocket ─────────────────────────────────────────────
 
   void _connect() {
     try {
@@ -83,51 +100,162 @@ class _VisionScreenState extends State<VisionScreen> {
       _channel.stream.listen(
         _onMessage,
         onDone: () => Future.delayed(const Duration(seconds: 2), _connect),
-        onError: (e) {
-          print('WebSocket error: $e');
-          Future.delayed(const Duration(seconds: 2), _connect);
-        },
+        onError: (_) => Future.delayed(const Duration(seconds: 2), _connect),
       );
-    } catch (e) {
-      print('Connection error: $e');
+    } catch (_) {
       Future.delayed(const Duration(seconds: 2), _connect);
     }
   }
 
   void _onMessage(dynamic raw) {
-    if (!_started) return; // don't process until user has interacted
     final data = jsonDecode(raw as String) as Map<String, dynamic>;
-    final urgency = data['urgency'] as String;
-    final phrase = _buildPhrase(data);
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final cooldown = urgency == 'high' ? 600 : 2000;
+    final type = data['type'] as String? ?? 'obstacle';
 
-    if (now - _lastSpokenMs < cooldown) return;
-    if (phrase == _lastPhrase && urgency != 'high') return;
-
-    if (urgency == 'high' && _isSpeaking) {
-      _tts.stop();
-      _isSpeaking = false;
+    if (type == 'search_result') {
+      _onSearchResult(data);
+      return;
     }
 
-    _lastSpokenMs = now;
-    _lastPhrase = phrase;
-    _queue.add(data);
+    // Don't queue warnings before user starts or while mic is active
+    if (!_started || _micActive) return;
+
+    final phrase = _buildWarningPhrase(data);
+    final urgency = data['urgency'] as String;
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    // Dedup: same phrase within cooldown window → skip
+    // High urgency has shorter cooldown and always interrupts
+    final cooldown = urgency == 'high' ? 800 : 3000;
+    final isDuplicate =
+        phrase == _lastQueuedPhrase && (now - _lastQueuedMs) < cooldown;
+
+    if (isDuplicate) return;
+
+    _lastQueuedPhrase = phrase;
+    _lastQueuedMs = now;
+
+    // High urgency: clear queue, stop current speech, jump to front
+    if (urgency == 'high') {
+      _queue.clear();
+      _tts.stop();
+      _queue.insert(0, {'phrase': phrase, 'priority': true});
+    } else {
+      // Only add if queue isn't already backed up
+      if (_queue.length < 3) {
+        _queue.add({'phrase': phrase, 'priority': false});
+      }
+    }
 
     if (mounted) setState(() => _lastDetection = phrase);
   }
 
-  void _processQueue() {
-    _queue.stream
-        .asyncMap((data) async {
-          _isSpeaking = true;
-          await _tts.synthesizeAndPlay(_buildPhrase(data));
-          _isSpeaking = false;
-        })
-        .listen((_) {});
+  void _onSearchResult(Map<String, dynamic> data) {
+    final found = data['found'] as bool;
+    final query = data['query'] as String;
+
+    final phrase = found
+        ? '$query is ${(data['distance'] as num).toStringAsFixed(1)} meters, ${data['direction']}'
+        : '$query not detected nearby';
+
+    // Interrupt everything, speak result immediately
+    _queue.clear();
+    _tts.stop();
+    _lastQueuedPhrase = ''; // reset so warnings resume after result
+    _lastQueuedMs = 0;
+
+    _queue.insert(0, {'phrase': phrase, 'priority': true});
+
+    if (mounted) setState(() => _lastDetection = phrase);
   }
 
-  String _buildPhrase(Map<String, dynamic> d) {
+  // ── queue loop ────────────────────────────────────────────
+
+  Future<void> _startQueueLoop() async {
+    if (_queueRunning) return;
+    _queueRunning = true;
+
+    while (true) {
+      try {
+        // Pause while mic is recording or transcribing
+        if (_micActive) {
+          await Future.delayed(const Duration(milliseconds: 50));
+          continue;
+        }
+
+        // Nothing to say
+        if (_queue.isEmpty) {
+          await Future.delayed(const Duration(milliseconds: 50));
+          continue;
+        }
+
+        // Take next item — priority first
+        final idx = _queue.indexWhere((d) => d['priority'] == true);
+        final item = idx != -1 ? _queue.removeAt(idx) : _queue.removeAt(0);
+        final phrase = item['phrase'] as String;
+
+        _isSpeaking = true;
+        if (mounted) setState(() {});
+
+        try {
+          await _tts.synthesizeAndPlay(phrase);
+        } catch (e) {
+          print('[QUEUE] Speak error: $e');
+        }
+
+        _isSpeaking = false;
+        print('[QUEUE] Done. Remaining: ${_queue.length}');
+        if (mounted) setState(() {});
+      } catch (e) {
+        print('[QUEUE] Loop error: $e');
+        _isSpeaking = false;
+        if (mounted) setState(() {});
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+  }
+
+  // ── mic ───────────────────────────────────────────────────
+
+  Future<void> _onMicHold() async {
+    if (_micActive) return;
+    _micActive = true;
+
+    // Stop speech and clear pending warnings
+    _tts.stop();
+    _queue.clear();
+
+    await _stt.startListening();
+    if (mounted) setState(() => _isListening = true);
+  }
+
+  Future<void> _onMicRelease() async {
+    if (!_micActive) return;
+
+    // Keep button red while transcribing
+    if (mounted) setState(() => _isListening = true);
+
+    final object = await _stt.stopAndTranscribe();
+    print('[STT] Got: $object');
+
+    // Release mic — queue loop resumes automatically
+    _micActive = false;
+    // Reset dedup so first warning after mic release always plays
+    _lastQueuedPhrase = '';
+    _lastQueuedMs = 0;
+
+    if (mounted) setState(() => _isListening = false);
+
+    if (object != null && object.trim().isNotEmpty) {
+      final q = object.trim();
+      _channel.sink.add(jsonEncode({'type': 'search', 'query': q}));
+      if (mounted) setState(() => _lastDetection = 'Searching for $q...');
+    }
+    // If null, mic just releases and warnings resume — nothing else needed
+  }
+
+  // ── helpers ───────────────────────────────────────────────
+
+  String _buildWarningPhrase(Map<String, dynamic> d) {
     final label = d['label'] as String;
     final distance = (d['distance'] as num).toStringAsFixed(1);
     final direction = d['direction'] as String;
@@ -139,6 +267,14 @@ class _VisionScreenState extends State<VisionScreen> {
     return '$label ahead, $distance meters';
   }
 
+  Color _phraseColor(String phrase) {
+    if (phrase.startsWith('Stop!')) return Colors.red.shade400;
+    if (phrase.contains('meters, move')) return Colors.orange.shade400;
+    return Colors.green.shade400;
+  }
+
+  // ── ui ────────────────────────────────────────────────────
+
   Future<void> _onStart() async {
     await _tts.unlock();
     setState(() {
@@ -147,31 +283,17 @@ class _VisionScreenState extends State<VisionScreen> {
     });
   }
 
-  Color _urgencyColor(String phrase) {
-    if (phrase.startsWith('Stop!')) return Colors.red.shade400;
-    if (phrase.contains('meters, move')) return Colors.orange.shade400;
-    return Colors.green.shade400;
-  }
-
-  @override
-  void dispose() {
-    _channel.sink.close();
-    _tts.stop();
-    _queue.close();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
-        child: _started ? _buildListeningScreen() : _buildStartScreen(),
+        child: _started ? _buildMain() : _buildStart(),
       ),
     );
   }
 
-  Widget _buildStartScreen() {
+  Widget _buildStart() {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -213,27 +335,28 @@ class _VisionScreenState extends State<VisionScreen> {
     );
   }
 
-  Widget _buildListeningScreen() {
-    final color = _lastDetection.isEmpty
-        ? Colors.white24
-        : _urgencyColor(_lastDetection);
+  Widget _buildMain() {
+    final color =
+        _lastDetection.isEmpty ? Colors.white24 : _phraseColor(_lastDetection);
 
     return Padding(
       padding: const EdgeInsets.all(32),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          // Status indicator dot
+          // Status dot
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
             width: 12,
             height: 12,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+            ),
           ),
           const SizedBox(height: 32),
 
-          // Last spoken phrase
+          // Detection text
           Text(
             _lastDetection.isEmpty ? 'No detections yet' : _lastDetection,
             textAlign: TextAlign.center,
@@ -244,7 +367,7 @@ class _VisionScreenState extends State<VisionScreen> {
               height: 1.5,
             ),
           ),
-          const SizedBox(height: 48),
+          const SizedBox(height: 32),
 
           // Speaking indicator
           AnimatedOpacity(
@@ -255,24 +378,62 @@ class _VisionScreenState extends State<VisionScreen> {
               children: [
                 Icon(Icons.volume_up, color: Colors.white38, size: 16),
                 SizedBox(width: 6),
-                Text(
-                  'Speaking...',
-                  style: TextStyle(color: Colors.white38, fontSize: 13),
-                ),
+                Text('Speaking...',
+                    style: TextStyle(color: Colors.white38, fontSize: 13)),
               ],
             ),
           ),
 
           const Spacer(),
 
-          // Stop button at the bottom
+          // Mic button
+          GestureDetector(
+            onTapDown: (_) => _onMicHold(),
+            onTapUp: (_) => _onMicRelease(),
+            onTapCancel: () => _onMicRelease(),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isListening ? Colors.red.shade800 : Colors.white12,
+                border: Border.all(
+                  color: _isListening ? Colors.red : Colors.white24,
+                  width: 1.5,
+                ),
+              ),
+              child: Icon(
+                _isListening ? Icons.mic : Icons.mic_none,
+                color: _isListening ? Colors.white : Colors.white54,
+                size: 28,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            _isListening
+                ? 'Listening... say "where\'s [object]"'
+                : 'Hold to ask',
+            style: const TextStyle(color: Colors.white24, fontSize: 12),
+          ),
+          const SizedBox(height: 24),
+
+          // Stop button
           TextButton(
-            onPressed: () => setState(() {
-              _started = false;
-              _lastDetection = '';
-              _status = 'Ready';
+            onPressed: () {
               _tts.stop();
-            }),
+              _queue.clear();
+              _micActive = false;
+              setState(() {
+                _started = false;
+                _isListening = false;
+                _lastDetection = '';
+                _lastQueuedPhrase = '';
+                _lastQueuedMs = 0;
+                _status = 'Ready';
+              });
+            },
             child: const Text(
               'Stop',
               style: TextStyle(color: Colors.white24, fontSize: 14),
