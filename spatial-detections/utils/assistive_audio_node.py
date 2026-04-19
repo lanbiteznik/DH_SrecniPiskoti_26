@@ -434,27 +434,27 @@ class AssistiveAudioNode(dai.node.HostNode):
         occ_r = zone_metrics_map["right"].occupied_ratio
         ttc_text = "inf" if dynamic.ttc_s == float("inf") else f"{dynamic.ttc_s:.1f}"
 
-        print(
-            "\r"
-            f"mode={self._mode} "
-            f"top={top/1000:.1f}m "
-            f"mid={mid/1000:.1f}m "
-            f"bot={bot/1000:.1f}m "
-            f"left={left/1000:.1f}m "
-            f"right={right/1000:.1f}m "
-            f"occL={occ_l:.2f} "
-            f"occR={occ_r:.2f} "
-            f"spd={dynamic.closing_speed_mm_s/1000:.2f}m/s "
-            f"ttc={ttc_text}s "
-            f"warn={dynamic.warn_mm/1000:.1f}m "
-            f"stop={dynamic.danger_mm/1000:.1f}m "
-            f"state={self._last_state} "
-            f"conf={confidence} "
-            f"cand={candidate or '-'} "
-            f"last={self._last_command or '-'}     ",
-            end="",
-            flush=True,
-        )
+        #print(
+        ##    "\r"
+        #  f"mode={self._mode} "
+        #    f"top={top/1000:.1f}m "
+        #    f"mid={mid/1000:.1f}m "
+        #    f"bot={bot/1000:.1f}m "
+        #    f"left={left/1000:.1f}m "
+        #    f"right={right/1000:.1f}m "
+        #    f"occL={occ_l:.2f} "
+        #    f"occR={occ_r:.2f} "
+        #    f"spd={dynamic.closing_speed_mm_s/1000:.2f}m/s "
+        #    f"ttc={ttc_text}s "
+        #    f"warn={dynamic.warn_mm/1000:.1f}m "
+        #    f"stop={dynamic.danger_mm/1000:.1f}m "
+        #    f"state={self._last_state} "
+        #    f"conf={confidence} "
+        #    f"cand={candidate or '-'} "
+        #    f"last={self._last_command or '-'}     ",
+        #    end="",
+        #    flush=True,
+        #)
 
     def _detect_stairs(self, frame: np.ndarray) -> Optional[str]:
         H, W = frame.shape
@@ -576,14 +576,18 @@ class AssistiveAudioNode(dai.node.HostNode):
                 "distance": best_dist,
                 "direction": best_dir,
             })
+            spoken = f"{best_label} found, {best_dist:.1f} meters {best_dir}"
             print(f"[SEARCH] '{query}' → found: {best_label} at {best_dist}m {best_dir}")
+            self._speak(spoken, priority=80)
         else:
             self._ws.send_to(ws, {
                 "type": "search_result",
                 "found": False,
                 "query": query,
             })
+            spoken = f"{query} not detected nearby"
             print(f"[SEARCH] '{query}' → not found in recent detections")
+            self._speak(spoken, priority=60)
 
     def _speak(self, text: str, priority: int = 0) -> None:
         current_running = self._tts_proc and self._tts_proc.poll() is None

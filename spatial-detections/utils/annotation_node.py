@@ -2,6 +2,7 @@ import depthai as dai
 from depthai_nodes import PRIMARY_COLOR, SECONDARY_COLOR, TRANSPARENT_PRIMARY_COLOR
 from depthai_nodes.utils import AnnotationHelper
 from typing import List, Optional, Tuple
+import time
 import cv2
 
 from .zones import (
