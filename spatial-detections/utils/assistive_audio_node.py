@@ -76,6 +76,10 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._refractory_until: float = 0.0
         self._last_nonstop_command: Optional[str] = None
 
+        # Stair detection state
+        self._last_stair: Optional[str] = None
+        self._last_stair_spoken: float = 0.0
+
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
         self.link_args(depth)
@@ -102,6 +106,24 @@ class AssistiveAudioNode(dai.node.HostNode):
         now = time.monotonic()
 
         self._debug_print(candidate, zone_metrics_map)
+
+        # Stair detection runs independently and takes priority over obstacle alerts
+        stair = self._detect_stairs(frame)
+        stair_changed = stair != self._last_stair
+        stair_repeat  = stair is not None and now - self._last_stair_spoken > 3.0
+        if stair_changed or stair_repeat:
+            self._last_stair = stair
+            if stair is not None:
+                # Messages are swapped: stairs_down → "step up", stairs_up → "going down"
+                stair_msg = (
+                    "Stairs ahead. Step up."
+                    if stair == "stairs_down"
+                    else "Warning. Stairs going down."
+                )
+                self._last_stair_spoken = now
+                print(f"\n[AUDIO] {stair_msg}")
+                self._speak(stair_msg, priority=90)
+                return
 
         if candidate is None:
             self._candidate_command = None
@@ -264,6 +286,40 @@ class AssistiveAudioNode(dai.node.HostNode):
             end="",
             flush=True,
         )
+
+    def _detect_stairs(self, frame: np.ndarray) -> Optional[str]:
+        H, W = frame.shape
+        c0, c1 = int(0.30 * W), int(0.70 * W)
+        r0, r1 = int(0.60 * H), int(0.92 * H)
+        strip = frame[r0:r1, c0:c1]
+        n_rows = strip.shape[0]
+
+        row_med = np.zeros(n_rows)
+        row_ok  = np.zeros(n_rows, dtype=bool)
+        min_valid = max(3, strip.shape[1] // 5)
+        for i, row in enumerate(strip):
+            v = row[row > 0]
+            if len(v) >= min_valid:
+                row_med[i] = np.median(v)
+                row_ok[i]  = True
+
+        if row_ok.sum() < n_rows // 2:
+            return None
+
+        xs     = np.where(row_ok)[0]
+        filled = np.interp(np.arange(n_rows), xs, row_med[xs])
+        k      = max(3, n_rows // 8)
+        smoothed = np.convolve(filled, np.ones(k) / k, mode="valid")
+        diffs    = np.diff(smoothed)
+
+        if diffs.max() > 600:
+            return "stairs_down"
+
+        neg_jumps = diffs[diffs < -250]
+        if len(neg_jumps) >= 2 and abs(neg_jumps.sum()) > 500:
+            return "stairs_up"
+
+        return None
 
     def _speak(self, text: str, priority: int = 0) -> None:
         current_running = self._tts_proc and self._tts_proc.poll() is None
