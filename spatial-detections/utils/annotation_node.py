@@ -6,7 +6,7 @@ import cv2
 
 from .zones import (
     ZONES, CONE_TL, CONE_TR, CONE_BR, CONE_BL,
-    DANGER_MM, WARN_MM, zone_dist, classify,
+    DANGER_MM, WARN_MM, zone_dist, classify, in_cone,
 )
 
 # Colors: (R, G, B, A)
@@ -28,15 +28,6 @@ STATE_COLORS = {
 # Only show zone overlays for the cone bands (not escape corridors — too cluttered)
 CONE_ZONES = ("cone_top", "cone_mid", "cone_bot")
 
-
-def _in_cone(cx: float, cy: float) -> bool:
-    r0, r1 = CONE_TL[1], CONE_BL[1]
-    if not (r0 <= cy <= r1):
-        return False
-    t = (cy - r0) / (r1 - r0)
-    left  = CONE_TL[0] + t * (CONE_BL[0] - CONE_TL[0])
-    right = CONE_TR[0] + t * (CONE_BR[0] - CONE_TR[0])
-    return left <= cx <= right
 
 
 class AnnotationNode(dai.node.HostNode):
@@ -133,7 +124,7 @@ class AnnotationNode(dai.node.HostNode):
                 detection.xmax,
                 detection.ymax,
             )
-            in_cone = _in_cone((xmin + xmax) / 2, (ymin + ymax) / 2)
+            in_cone = in_cone((xmin + xmax) / 2, (ymin + ymax) / 2)
 
             annotation_helper.draw_rectangle(
                 top_left=(xmin, ymin),

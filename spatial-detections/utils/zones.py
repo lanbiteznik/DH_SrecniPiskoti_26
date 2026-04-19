@@ -5,6 +5,18 @@ DANGER_MM = 800
 WARN_MM   = 1500
 CLEAR_MM  = 2000
 
+# Named-object announcement tiers (mm): far warning / mid warning / stop
+OBJ_TIERS = [8000, 5000, 2000]
+
+# COCO classes worth announcing as navigation obstacles
+OBSTACLE_CLASSES = {
+    "person", "bicycle", "car", "motorcycle", "bus", "truck",
+    "dog", "cat", "horse", "sheep", "cow", "elephant", "bear",
+    "chair", "couch", "bed", "dining table", "toilet",
+    "bench", "fire hydrant", "parking meter",
+    "backpack", "umbrella", "suitcase",
+}
+
 # Zone layout: (row_start, row_end, col_start, col_end) as fractions of frame dims.
 # The cone stops at row 0.78 — rows below that are near-floor which the camera
 # always sees as close regardless of actual obstacles.
@@ -26,6 +38,16 @@ CONE_BL = (0.28, 0.78)
 # Percentile used for robust "closest obstacle" estimate.
 # 15th is less twitchy than 10th while still catching real obstacles.
 DEPTH_PERCENTILE = 15
+
+
+def in_cone(cx: float, cy: float) -> bool:
+    r0, r1 = CONE_TL[1], CONE_BL[1]
+    if not (r0 <= cy <= r1):
+        return False
+    t = (cy - r0) / (r1 - r0)
+    left  = CONE_TL[0] + t * (CONE_BL[0] - CONE_TL[0])
+    right = CONE_TR[0] + t * (CONE_BR[0] - CONE_TR[0])
+    return left <= cx <= right
 
 
 def zone_dist(frame: np.ndarray, r0: float, r1: float, c0: float, c1: float) -> float:

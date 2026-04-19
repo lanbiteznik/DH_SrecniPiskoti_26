@@ -76,9 +76,12 @@ with dai.Pipeline(device) as pipeline:
         input_detections=nn.out, depth=stereo.depth, labels=classes
     )
 
-    # assistive audio — depth-based obstacle detection
+    # assistive audio — named object detection + depth-based obstacle fallback
     assistive_audio_node = pipeline.create(AssistiveAudioNode).build(
-        depth=stereo.depth, interval=args.interval
+        depth=stereo.depth,
+        detections=nn.out,
+        labels=classes,
+        interval=args.interval,
     )
 
     apply_colormap = pipeline.create(ApplyColormap).build(stereo.depth)
