@@ -33,17 +33,24 @@ class ElevenLabsTTS:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self._priority = 0
+        self._speaking = False
+        self._generation = 0
 
     def speak(self, text: str, priority: int = 0) -> None:
         with self._lock:
-            if self._proc and self._proc.poll() is None:
+            if self._speaking:
                 if priority > self._priority:
-                    self._proc.terminate()
+                    if self._proc and self._proc.poll() is None:
+                        self._proc.terminate()
                 else:
                     return
-            self._priority = priority
 
-        t = threading.Thread(target=self._fetch_and_play, args=(text,), daemon=True)
+            self._priority = priority
+            self._speaking = True
+            self._generation += 1
+            generation = self._generation
+
+        t = threading.Thread(target=self._fetch_and_play, args=(text, generation), daemon=True)
         t.start()
 
     def terminate(self) -> None:
@@ -51,7 +58,7 @@ class ElevenLabsTTS:
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
 
-    def _fetch_and_play(self, text: str) -> None:
+    def _fetch_and_play(self, text: str, generation: int) -> None:
         try:
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice_id}/stream"
             headers = {
@@ -79,14 +86,22 @@ class ElevenLabsTTS:
                 if proc.poll() is not None:
                     break
                 try:
+                    if proc.stdin is None:
+                        break
                     proc.stdin.write(chunk)
                 except BrokenPipeError:
                     break
             try:
-                proc.stdin.close()
+                if proc.stdin is not None:
+                    proc.stdin.close()
             except Exception:
                 pass
             proc.wait()
 
         except Exception as e:
             print(f"[TTS] ElevenLabs error: {e}")
+        finally:
+            with self._lock:
+                if generation == self._generation:
+                    self._speaking = False
+                    self._proc = None
