@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'tts/tts_factory.dart';
 import 'stt_service.dart';
@@ -57,7 +58,8 @@ class _VisionScreenState extends State<VisionScreen> {
   String _lastQueuedPhrase = '';
   int _lastQueuedMs = 0;
 
-  static const _wsUrl = 'ws://localhost:8001/ws';
+  String get _wsUrl => AppConfig.websocketUrl;
+  String get _searchUrl => AppConfig.searchUrl;
 
   // ── lifecycle ─────────────────────────────────────────────
 
@@ -247,10 +249,26 @@ class _VisionScreenState extends State<VisionScreen> {
 
     if (object != null && object.trim().isNotEmpty) {
       final q = object.trim();
-      _channel.sink.add(jsonEncode({'type': 'search', 'query': q}));
       if (mounted) setState(() => _lastDetection = 'Searching for $q...');
+      _searchFor(q);
     }
     // If null, mic just releases and warnings resume — nothing else needed
+  }
+
+  Future<void> _searchFor(String query) async {
+    try {
+      final uri = Uri.parse(_searchUrl).replace(queryParameters: {'q': query});
+      final response = await http
+          .get(uri, headers: {'ngrok-skip-browser-warning': 'true'})
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        _onSearchResult({'type': 'search_result', 'query': query, ...data});
+      }
+    } catch (e) {
+      print('[Search] Error: $e');
+      _onSearchResult({'type': 'search_result', 'found': false, 'query': query});
+    }
   }
 
   // ── helpers ───────────────────────────────────────────────

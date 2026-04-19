@@ -16,9 +16,18 @@ class AppConfig {
   static String get elevenLabsVoiceId =>
       dotenv.env['ELEVENLABS_VOICE_ID'] ?? 'NOT_SET';
 
-  // WebSocket configuration
+  // Base URL of the detection backend.
+  // Same network: http://192.168.1.42:8001
+  // Over internet: https://xxxx.ngrok-free.app
+  static String get backendUrl =>
+      (dotenv.env['BACKEND_URL'] ?? 'http://localhost:8001').trimRight('/');
+
+  // REST search endpoint
+  static String get searchUrl => '$backendUrl/search';
+
+  // WebSocket URL derived from backendUrl (http→ws, https→wss)
   static String get websocketUrl =>
-      dotenv.env['WEBSOCKET_URL'] ?? 'ws://localhost:8001/ws';
+      '${backendUrl.replaceFirst(RegExp(r'^http'), 'ws')}/ws';
 
   // Environment configuration
   static String get environment => dotenv.env['ENVIRONMENT'] ?? 'development';
@@ -30,7 +39,7 @@ class AppConfig {
   static bool get isValid {
     return elevenLabsApiKey != 'NOT_SET' &&
         elevenLabsVoiceId != 'NOT_SET' &&
-        websocketUrl.isNotEmpty;
+        backendUrl.isNotEmpty;
   }
 
   static String getStatus() {
@@ -43,7 +52,7 @@ Vision Assistant Configuration:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ElevenLabs API Key: $keyPreview
 Voice ID: $elevenLabsVoiceId
-WebSocket: $websocketUrl
+Backend: $backendUrl
 Environment: $environment
 Debug Logging: $debugLogging
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

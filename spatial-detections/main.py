@@ -4,6 +4,7 @@ from depthai_nodes.node import ApplyColormap
 from utils.arguments import initialize_argparser
 from utils.annotation_node import AnnotationNode
 from utils.assistive_audio_node import AssistiveAudioNode
+from utils.search_node import SearchNode
 
 _, args = initialize_argparser()
 
@@ -79,6 +80,12 @@ with dai.Pipeline(device) as pipeline:
     # assistive audio — depth-based obstacle detection
     assistive_audio_node = pipeline.create(AssistiveAudioNode).build(
         depth=stereo.depth, interval=args.interval
+    )
+
+    # object search — WebSocket server on :8001 for Flutter search queries
+    search_node = pipeline.create(SearchNode).build(
+        input_detections=nn.out,
+        labels=classes,
     )
 
     apply_colormap = pipeline.create(ApplyColormap).build(stereo.depth)
