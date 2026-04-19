@@ -15,6 +15,8 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._interval   = 2.0
         self._last_state = "clear"
         self._last_spoken: float = 0.0
+        self._last_stair: Optional[str] = None
+        self._last_stair_spoken: float = 0.0
         self._tts_proc = None
 
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
@@ -42,6 +44,19 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         new_state = classify(cone_dist)
         now = time.monotonic()
+
+        # Stair detection runs independently of obstacle alerts
+        stair = self._detect_stairs(frame)
+        stair_changed = stair != self._last_stair
+        stair_repeat  = stair is not None and now - self._last_stair_spoken > 3.0
+        if stair_changed or stair_repeat:
+            self._last_stair = stair
+            if stair is not None:
+                stair_msg = "Warning. Stairs going down." if stair == "stairs_down" else "Stairs ahead. Step up."
+                self._last_stair_spoken = now
+                print(f"\n[AUDIO] {stair_msg}")
+                self._speak(stair_msg)
+                return  # don't overlap with obstacle message this frame
 
         state_changed = new_state != self._last_state
         repeat_alert  = new_state != "clear" and now - self._last_spoken > self._interval
@@ -82,6 +97,49 @@ class AssistiveAudioNode(dai.node.HostNode):
             else:
                 print(f"  {name:9s}: no valid pixels")
         print(f"{'='*60}\n")
+
+    def _detect_stairs(self, frame: np.ndarray) -> Optional[str]:
+        """
+        Analyzes the vertical depth profile in the floor zone to detect stairs.
+
+        Flat floor: depth decreases going down the frame (floor gets closer).
+        Stair descent: depth spikes UP at the step edge (floor drops away).
+        Stair ascent: multiple discrete depth-decrease steps (stair treads).
+        """
+        H, W = frame.shape
+        c0, c1 = int(0.30 * W), int(0.70 * W)
+        r0, r1 = int(0.60 * H), int(0.92 * H)
+        strip = frame[r0:r1, c0:c1]
+        n_rows = strip.shape[0]
+
+        row_med = np.zeros(n_rows)
+        row_ok  = np.zeros(n_rows, dtype=bool)
+        min_valid = max(3, strip.shape[1] // 5)
+        for i, row in enumerate(strip):
+            v = row[row > 0]
+            if len(v) >= min_valid:
+                row_med[i] = np.median(v)
+                row_ok[i]  = True
+
+        if row_ok.sum() < n_rows // 2:
+            return None
+
+        xs     = np.where(row_ok)[0]
+        filled = np.interp(np.arange(n_rows), xs, row_med[xs])
+        k      = max(3, n_rows // 8)
+        smoothed = np.convolve(filled, np.ones(k) / k, mode="valid")
+        diffs    = np.diff(smoothed)
+
+        # Descent: floor depth suddenly jumps UP (step edge, floor drops away)
+        if diffs.max() > 600:
+            return "stairs_down"
+
+        # Ascent: 2+ discrete downward depth jumps (stair treads visible)
+        neg_jumps = diffs[diffs < -250]
+        if len(neg_jumps) >= 2 and abs(neg_jumps.sum()) > 500:
+            return "stairs_up"
+
+        return None
 
     def _build_message(self, state: str, cone_dist: float, dists: dict) -> Optional[str]:
         if state == "clear":
