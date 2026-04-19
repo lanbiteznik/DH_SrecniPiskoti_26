@@ -43,6 +43,15 @@ def initialize_argparser():
         type=float,
     )
 
+    parser.add_argument(
+        "--mode",
+        help="Guidance mode.",
+        required=False,
+        default="safe",
+        choices=["safe", "confident"],
+        type=str,
+    )
+
     args = parser.parse_args()
 
     return parser, args

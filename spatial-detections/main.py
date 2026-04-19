@@ -31,7 +31,6 @@ if len(available_cameras) < 3:
 with dai.Pipeline(device) as pipeline:
     print("Creating pipeline...")
 
-    # detection model
     det_model_description = dai.NNModelDescription.fromYamlFile(
         f"yolov10_nano_r2_coco.{platform}.yaml"
     )
@@ -41,7 +40,6 @@ with dai.Pipeline(device) as pipeline:
     classes = det_model_nn_archive.getConfig().model.heads[0].metadata.classes
     nn_size = det_model_nn_archive.getInputSize()
 
-    # camera input
     cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
 
     left_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
@@ -66,24 +64,25 @@ with dai.Pipeline(device) as pipeline:
         fps=float(args.fps_limit),
     )
     if platform == "RVC2":
-        nn.setNNArchive(
-            det_model_nn_archive, numShaves=7
-        )  # TODO: change to numShaves=4 if running on OAK-D Lite
+        nn.setNNArchive(det_model_nn_archive, numShaves=4)
     nn.setBoundingBoxScaleFactor(0.7)
 
-    # annotation
     annotation_node = pipeline.create(AnnotationNode).build(
-        input_detections=nn.out, depth=stereo.depth, labels=classes
+        input_detections=nn.out,
+        depth=stereo.depth,
+        labels=classes,
     )
 
-    # assistive audio — depth-based obstacle detection
     assistive_audio_node = pipeline.create(AssistiveAudioNode).build(
-        depth=stereo.depth, interval=args.interval
+        depth=stereo.depth,
+        detections=nn.out,
+        labels=classes,
+        interval=args.interval,
+        mode=args.mode,
     )
 
     apply_colormap = pipeline.create(ApplyColormap).build(stereo.depth)
 
-    # video encoding
     cam_nv12 = cam.requestOutput(
         size=nn_size,
         fps=args.fps_limit,
@@ -96,7 +95,6 @@ with dai.Pipeline(device) as pipeline:
     )
     cam_nv12.link(video_encoder.input)
 
-    # depth colormap encoding
     depth_encoder_manip = pipeline.create(dai.node.ImageManip)
     depth_encoder_manip.setMaxOutputFrameSize(nn_size[0] * nn_size[1] * 3)
     depth_encoder_manip.initialConfig.setOutputSize(*nn_size)
@@ -110,7 +108,6 @@ with dai.Pipeline(device) as pipeline:
     )
     depth_encoder_manip.out.link(depth_encoder.input)
 
-    # visualization
     visualizer.addTopic("Camera", video_encoder.out)
     visualizer.addTopic("Detections", annotation_node.out_annotations)
     visualizer.addTopic("Depth", depth_encoder.out)
@@ -125,4 +122,3 @@ with dai.Pipeline(device) as pipeline:
         if key == ord("q"):
             print("Got q key. Exiting...")
             break
-            

@@ -1,7 +1,7 @@
 import depthai as dai
 from depthai_nodes import PRIMARY_COLOR, SECONDARY_COLOR, TRANSPARENT_PRIMARY_COLOR
 from depthai_nodes.utils import AnnotationHelper
-from typing import List
+from typing import List, Optional, Tuple
 import cv2
 
 from .zones import (
@@ -13,22 +13,23 @@ from .zones import (
     get_zone_metrics,
     classify,
     decide_command,
+    command_confidence,
 )
 
 # Colors: (R, G, B, A)
-CONE_OUTLINE     = (1.0, 1.0, 0.0, 0.9)
-CONE_FILL        = (1.0, 1.0, 0.0, 0.06)
-DANGER_OUTLINE   = (1.0, 0.0, 0.0, 1.0)
-DANGER_FILL      = (1.0, 0.0, 0.0, 0.20)
-WARN_OUTLINE     = (1.0, 0.55, 0.0, 1.0)
-WARN_FILL        = (1.0, 0.55, 0.0, 0.14)
-CLEAR_OUTLINE    = (0.0, 1.0, 0.3, 0.7)
-CLEAR_FILL       = (0.0, 1.0, 0.3, 0.05)
+CONE_OUTLINE = (1.0, 1.0, 0.0, 0.9)
+CONE_FILL = (1.0, 1.0, 0.0, 0.06)
+DANGER_OUTLINE = (1.0, 0.0, 0.0, 1.0)
+DANGER_FILL = (1.0, 0.0, 0.0, 0.20)
+WARN_OUTLINE = (1.0, 0.55, 0.0, 1.0)
+WARN_FILL = (1.0, 0.55, 0.0, 0.14)
+CLEAR_OUTLINE = (0.0, 1.0, 0.3, 0.7)
+CLEAR_FILL = (0.0, 1.0, 0.3, 0.05)
 
 STATE_COLORS = {
     "danger": (DANGER_OUTLINE, DANGER_FILL),
-    "warn":   (WARN_OUTLINE,   WARN_FILL),
-    "clear":  (CLEAR_OUTLINE,  CLEAR_FILL),
+    "warn": (WARN_OUTLINE, WARN_FILL),
+    "clear": (CLEAR_OUTLINE, CLEAR_FILL),
 }
 
 COMMAND_TEXT = {
@@ -37,6 +38,12 @@ COMMAND_TEXT = {
     "STEP_RIGHT": "STEP RIGHT",
     "WAIT": "WAIT",
     "FORWARD": "FORWARD",
+}
+
+CONFIDENCE_COLORS = {
+    "HIGH": (0.0, 1.0, 0.3, 1.0),
+    "MED": (1.0, 0.85, 0.0, 1.0),
+    "LOW": (1.0, 0.35, 0.0, 1.0),
 }
 
 # Only show zone overlays for the cone bands (not escape corridors — too cluttered)
@@ -53,6 +60,16 @@ def _in_cone(cx: float, cy: float) -> bool:
     return left <= cx <= right
 
 
+def _clean_label(label: str) -> str:
+    mapping = {
+        "dining table": "table",
+        "potted plant": "plant",
+        "tvmonitor": "screen",
+        "cell phone": "phone",
+    }
+    return mapping.get(label.lower(), label.lower())
+
+
 class AnnotationNode(dai.node.HostNode):
     def __init__(self) -> None:
         super().__init__()
@@ -67,8 +84,9 @@ class AnnotationNode(dai.node.HostNode):
                 dai.Node.DatatypeHierarchy(dai.DatatypeEnum.ImgFrame, True)
             ]
         )
-        self.labels = []
+        self.labels: List[str] = []
         self._last_state = "clear"
+        self._last_command: Optional[str] = None
 
     def build(
         self,
@@ -80,6 +98,26 @@ class AnnotationNode(dai.node.HostNode):
         self.link_args(input_detections, depth)
         return self
 
+    def _closest_detection_label(
+        self, detections_list: List[dai.SpatialImgDetection]
+    ) -> Optional[Tuple[str, float]]:
+        closest = None
+        closest_z = float("inf")
+
+        for d in detections_list:
+            z = d.spatialCoordinates.z
+            if z <= 0:
+                continue
+            if z < closest_z:
+                closest_z = z
+                closest = d
+
+        if closest is None:
+            return None
+
+        label = self.labels[closest.label] if 0 <= closest.label < len(self.labels) else "obstacle"
+        return _clean_label(label), closest_z
+
     def process(
         self, detections_message: dai.Buffer, depth_message: dai.ImgFrame
     ) -> None:
@@ -89,10 +127,14 @@ class AnnotationNode(dai.node.HostNode):
         zone_metrics_map = get_zone_metrics(depth_frame)
         command, state = decide_command(zone_metrics_map, self._last_state)
         self._last_state = state
+        if command:
+            self._last_command = command
+
+        confidence = command_confidence(zone_metrics_map, command)
 
         annotation_helper = AnnotationHelper()
 
-        # Draw cone zone bands, colored by their danger state
+        # Draw cone zone bands
         for name in CONE_ZONES:
             r0, r1, c0, c1 = ZONES[name]
             d = zone_metrics_map[name].dist_mm
@@ -112,7 +154,7 @@ class AnnotationNode(dai.node.HostNode):
                 color=outline,
             )
 
-        # Draw the overall cone trapezoid outline (yellow) on top
+        # Draw overall cone
         annotation_helper.draw_polyline(
             points=[CONE_TL, CONE_TR, CONE_BR, CONE_BL],
             outline_color=CONE_OUTLINE,
@@ -121,7 +163,7 @@ class AnnotationNode(dai.node.HostNode):
             closed=True,
         )
 
-        # Draw escape corridor states
+        # Draw escape corridors
         for side in ("left", "right"):
             r0, r1, c0, c1 = ZONES[side]
             d = zone_metrics_map[side].dist_mm
@@ -157,8 +199,32 @@ class AnnotationNode(dai.node.HostNode):
                 color=SECONDARY_COLOR,
             )
 
-        # Draw detections — red if inside the cone, default color otherwise
+        annotation_helper.draw_text(
+            text=f"CONFIDENCE: {confidence}",
+            position=(0.03, 0.14),
+            size=15,
+            color=CONFIDENCE_COLORS[confidence],
+        )
+
+        annotation_helper.draw_text(
+            text=f"LAST CMD: {COMMAND_TEXT.get(self._last_command, self._last_command or '-')}",
+            position=(0.03, 0.19),
+            size=14,
+            color=SECONDARY_COLOR,
+        )
+
         detections_list: List[dai.SpatialImgDetection] = detections_message.detections
+        closest_info = self._closest_detection_label(detections_list)
+        if closest_info:
+            label, z = closest_info
+            annotation_helper.draw_text(
+                text=f"HAZARD: {label.upper()} ({z/1000:.1f}m)",
+                position=(0.03, 0.24),
+                size=14,
+                color=SECONDARY_COLOR,
+            )
+
+        # Draw detections
         for detection in detections_list:
             xmin, ymin, xmax, ymax = (
                 detection.xmin,
@@ -175,9 +241,10 @@ class AnnotationNode(dai.node.HostNode):
                 fill_color=DANGER_FILL if in_cone else TRANSPARENT_PRIMARY_COLOR,
                 thickness=2.0,
             )
+            label = self.labels[detection.label] if 0 <= detection.label < len(self.labels) else "object"
             annotation_helper.draw_text(
                 text=(
-                    f"{self.labels[detection.label]} {int(detection.confidence * 100)}%\n"
+                    f"{label} {int(detection.confidence * 100)}%\n"
                     f"x: {detection.spatialCoordinates.x:.0f}mm\n"
                     f"y: {detection.spatialCoordinates.y:.0f}mm\n"
                     f"z: {detection.spatialCoordinates.z:.0f}mm"

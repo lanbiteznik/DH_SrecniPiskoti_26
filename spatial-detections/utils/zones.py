@@ -26,25 +26,20 @@ SIDE_STRONG_MARGIN_MM = 600
 OCCUPANCY_THRESHOLD = 0.12
 
 # Zone layout: (row_start, row_end, col_start, col_end) as fractions of frame dims.
-# The cone stops at row 0.78 — rows below that are near-floor which the camera
-# always sees as close regardless of actual obstacles.
-# Left/right corridors are capped at row 0.68 for the same reason.
 ZONES = {
-    "cone_top": (0.10, 0.38, 0.42, 0.58),  # narrow (far)
-    "cone_mid": (0.38, 0.62, 0.35, 0.65),  # medium
-    "cone_bot": (0.62, 0.78, 0.28, 0.72),  # wide (near), but above floor zone
-    "left":     (0.20, 0.68, 0.00, 0.25),  # left escape corridor
-    "right":    (0.20, 0.68, 0.75, 1.00),  # right escape corridor
+    "cone_top": (0.10, 0.38, 0.42, 0.58),
+    "cone_mid": (0.38, 0.62, 0.35, 0.65),
+    "cone_bot": (0.62, 0.78, 0.28, 0.72),
+    "left": (0.20, 0.68, 0.00, 0.25),
+    "right": (0.20, 0.68, 0.75, 1.00),
 }
 
-# Cone trapezoid corners (col, row) for drawing — matches ZONES geometry
+# Cone trapezoid corners
 CONE_TL = (0.42, 0.10)
 CONE_TR = (0.58, 0.10)
 CONE_BR = (0.72, 0.78)
 CONE_BL = (0.28, 0.78)
 
-# Percentile used for robust "closest obstacle" estimate.
-# 15th is less twitchy than 10th while still catching real obstacles.
 DEPTH_PERCENTILE = 15
 
 
@@ -128,7 +123,6 @@ def classify_with_hysteresis(
             return "clear"
         return "warn"
 
-    # Previous clear
     if cone_bot <= BOTTOM_DANGER_MM or min(cone_mid, cone_top) <= DANGER_ENTER_MM:
         return "danger"
     if cone_bot <= BOTTOM_WARN_MM or min(cone_mid, cone_top) <= WARN_ENTER_MM:
@@ -167,7 +161,10 @@ def pick_escape_or_stop(
     return "STOP" if strong else "WAIT"
 
 
-def decide_command(zone_metrics_map: dict[str, ZoneMetrics], previous_state: str = "clear") -> tuple[Optional[str], str]:
+def decide_command(
+    zone_metrics_map: dict[str, ZoneMetrics],
+    previous_state: str = "clear",
+) -> tuple[Optional[str], str]:
     cone_top = zone_metrics_map["cone_top"].dist_mm
     cone_mid = zone_metrics_map["cone_mid"].dist_mm
     cone_bot = zone_metrics_map["cone_bot"].dist_mm
@@ -180,7 +177,6 @@ def decide_command(zone_metrics_map: dict[str, ZoneMetrics], previous_state: str
 
     state = classify_with_hysteresis(cone_top, cone_mid, cone_bot, previous_state)
 
-    # Emergency handling: heavily prioritize lower region
     if cone_bot <= BOTTOM_DANGER_MM or (
         cone_mid <= DANGER_ENTER_MM and cone_bot <= DANGER_EXIT_MM
     ):
@@ -192,11 +188,44 @@ def decide_command(zone_metrics_map: dict[str, ZoneMetrics], previous_state: str
     if state == "warn":
         return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=False), state
 
-    if (
-        cone_top > CLEAR_MM
-        and cone_mid > CLEAR_MM
-        and cone_bot > CLEAR_MM
-    ):
+    if cone_top > CLEAR_MM and cone_mid > CLEAR_MM and cone_bot > CLEAR_MM:
         return "FORWARD", state
 
     return None, state
+
+
+def command_confidence(
+    zone_metrics_map: dict[str, ZoneMetrics],
+    command: Optional[str],
+) -> str:
+    if command is None:
+        return "LOW"
+
+    top = zone_metrics_map["cone_top"].dist_mm
+    mid = zone_metrics_map["cone_mid"].dist_mm
+    bot = zone_metrics_map["cone_bot"].dist_mm
+    left = zone_metrics_map["left"].dist_mm
+    right = zone_metrics_map["right"].dist_mm
+
+    if command == "STOP":
+        if bot <= BOTTOM_DANGER_MM:
+            return "HIGH"
+        return "MED"
+
+    if command in {"STEP_LEFT", "STEP_RIGHT"}:
+        side_gap = abs(left - right)
+        if side_gap > SIDE_STRONG_MARGIN_MM:
+            return "HIGH"
+        if side_gap > SIDE_MARGIN_MM:
+            return "MED"
+        return "LOW"
+
+    if command == "FORWARD":
+        if top > CLEAR_MM and mid > CLEAR_MM and bot > CLEAR_MM:
+            return "HIGH"
+        return "MED"
+
+    if command == "WAIT":
+        return "MED"
+
+    return "LOW"

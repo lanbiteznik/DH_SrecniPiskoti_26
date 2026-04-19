@@ -1,6 +1,6 @@
 import subprocess
 import time
-from typing import Optional
+from typing import List, Optional
 
 import depthai as dai
 import numpy as np
@@ -9,34 +9,24 @@ from .zones import (
     ZONES,
     get_zone_metrics,
     decide_command,
+    command_confidence,
     SIDE_MARGIN_MM,
-    SIDE_STRONG_MARGIN_MM,
 )
 
 
+def _clean_label(label: str) -> str:
+    mapping = {
+        "dining table": "table",
+        "potted plant": "plant",
+        "tvmonitor": "screen",
+        "cell phone": "phone",
+    }
+    return mapping.get(label.lower(), label.lower())
+
+
 class AssistiveAudioNode(dai.node.HostNode):
-    # Extra margin required to flip direction shortly after speaking
     DIRECTION_FLIP_EXTRA_MARGIN_MM = 400
 
-    # Candidate command persistence before speaking
-    CONFIRM_SECONDS = {
-        "STOP": 0.0,
-        "STEP_LEFT": 0.35,
-        "STEP_RIGHT": 0.35,
-        "WAIT": 0.50,
-        "FORWARD": 0.80,
-    }
-
-    # Speech cooldowns
-    COOLDOWN_SECONDS = {
-        "STOP": 0.0,
-        "STEP_LEFT": 1.5,
-        "STEP_RIGHT": 1.5,
-        "WAIT": 2.0,
-        "FORWARD": 3.0,
-    }
-
-    # Spoken phrases
     COMMAND_TEXT = {
         "STOP": "Stop.",
         "STEP_LEFT": "Step left.",
@@ -45,7 +35,6 @@ class AssistiveAudioNode(dai.node.HostNode):
         "FORWARD": "Forward.",
     }
 
-    # Command priorities (higher = more important)
     COMMAND_PRIORITY = {
         "STOP": 100,
         "STEP_LEFT": 70,
@@ -54,11 +43,47 @@ class AssistiveAudioNode(dai.node.HostNode):
         "FORWARD": 10,
     }
 
+    SAFE_CONFIRM_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 0.40,
+        "STEP_RIGHT": 0.40,
+        "WAIT": 0.60,
+        "FORWARD": 1.00,
+    }
+
+    CONFIDENT_CONFIRM_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 0.25,
+        "STEP_RIGHT": 0.25,
+        "WAIT": 0.35,
+        "FORWARD": 0.60,
+    }
+
+    SAFE_COOLDOWN_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 1.8,
+        "STEP_RIGHT": 1.8,
+        "WAIT": 2.2,
+        "FORWARD": 3.5,
+    }
+
+    CONFIDENT_COOLDOWN_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 1.0,
+        "STEP_RIGHT": 1.0,
+        "WAIT": 1.4,
+        "FORWARD": 2.0,
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self.input_depth = self.createInput()
+        self.input_detections = self.createInput()
 
         self._interval = 2.0
+        self._mode = "safe"
+        self.labels: List[str] = []
+
         self._tts_proc = None
         self._tts_priority = 0
 
@@ -72,20 +97,55 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._candidate_command: Optional[str] = None
         self._candidate_since: float = 0.0
 
-        # Anti-spam controls
         self._refractory_until: float = 0.0
         self._last_nonstop_command: Optional[str] = None
 
-        # Stair detection state
         self._last_stair: Optional[str] = None
         self._last_stair_spoken: float = 0.0
 
-    def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
+        self._history: list[tuple[float, str, str]] = []
+
+    def build(
+        self,
+        depth: dai.Node.Output,
+        detections: dai.Node.Output,
+        labels: List[str],
+        interval: float = 2.0,
+        mode: str = "safe",
+    ) -> "AssistiveAudioNode":
         self._interval = interval
-        self.link_args(depth)
+        self._mode = mode
+        self.labels = labels
+        self.link_args(depth, detections)
         return self
 
-    def process(self, depth_message: dai.ImgFrame) -> None:
+    @property
+    def _confirm_seconds(self) -> dict[str, float]:
+        return (
+            self.CONFIDENT_CONFIRM_SECONDS
+            if self._mode == "confident"
+            else self.SAFE_CONFIRM_SECONDS
+        )
+
+    @property
+    def _cooldown_seconds(self) -> dict[str, float]:
+        return (
+            self.CONFIDENT_COOLDOWN_SECONDS
+            if self._mode == "confident"
+            else self.SAFE_COOLDOWN_SECONDS
+        )
+
+    @property
+    def _refractory_duration(self) -> float:
+        return 0.9 if self._mode == "confident" else 1.3
+
+    def process(
+        self,
+        depth_message: dai.ImgFrame,
+        detections_message: dai.Buffer,
+    ) -> None:
+        assert isinstance(detections_message, dai.SpatialImgDetections)
+
         frame = depth_message.getCvFrame()
         if frame is None or not frame.any():
             return
@@ -96,25 +156,24 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         zone_metrics_map = get_zone_metrics(frame)
 
-        # Apply smoothing to distances only for audio behavior
+        # Smooth only distances for calmer audio
         for name, metrics in zone_metrics_map.items():
-            smoothed = self._smooth_distance(name, metrics.dist_mm)
-            metrics.dist_mm = smoothed
+            metrics.dist_mm = self._smooth_distance(name, metrics.dist_mm)
 
         candidate, state = decide_command(zone_metrics_map, self._last_state)
         self._last_state = state
+        confidence = command_confidence(zone_metrics_map, candidate)
         now = time.monotonic()
 
-        self._debug_print(candidate, zone_metrics_map)
+        self._debug_print(candidate, zone_metrics_map, confidence)
 
-        # Stair detection runs independently and takes priority over obstacle alerts
+        # Stair detection gets high priority
         stair = self._detect_stairs(frame)
         stair_changed = stair != self._last_stair
-        stair_repeat  = stair is not None and now - self._last_stair_spoken > 3.0
+        stair_repeat = stair is not None and now - self._last_stair_spoken > 3.0
         if stair_changed or stair_repeat:
             self._last_stair = stair
             if stair is not None:
-                # Messages are swapped: stairs_down → "step up", stairs_up → "going down"
                 stair_msg = (
                     "Stairs ahead. Step up."
                     if stair == "stairs_down"
@@ -129,7 +188,6 @@ class AssistiveAudioNode(dai.node.HostNode):
             self._candidate_command = None
             return
 
-        # Apply direction stickiness before persistence/speech gating
         candidate = self._apply_direction_stickiness(candidate, zone_metrics_map, now)
 
         if candidate != self._candidate_command:
@@ -137,23 +195,70 @@ class AssistiveAudioNode(dai.node.HostNode):
             self._candidate_since = now
             return
 
-        confirm_seconds = self.CONFIRM_SECONDS.get(candidate, 0.4)
+        confirm_seconds = self._confirm_seconds.get(candidate, 0.4)
         if now - self._candidate_since < confirm_seconds:
             return
 
         if not self._should_speak(candidate, now):
             return
 
+        hazard_label = None
+        if confidence in {"HIGH", "MED"}:
+            hazard_label = self._get_primary_hazard_label(detections_message)
+
+        spoken = self._compose_message(candidate, hazard_label)
+
         self._last_command = candidate
         self._last_spoken = now
 
         if candidate != "STOP":
             self._last_nonstop_command = candidate
-            self._refractory_until = now + 1.2
+            self._refractory_until = now + self._refractory_duration
 
-        spoken = self.COMMAND_TEXT[candidate]
+        self._history.append((now, candidate, spoken))
+        self._history = self._history[-5:]
+
         print(f"\n[AUDIO] {spoken}")
         self._speak(spoken, priority=self.COMMAND_PRIORITY[candidate])
+
+    def _label_name(self, label_idx: int) -> str:
+        if 0 <= label_idx < len(self.labels):
+            return _clean_label(self.labels[label_idx])
+        return "obstacle"
+
+    def _get_primary_hazard_label(
+        self, detections_message: dai.SpatialImgDetections
+    ) -> Optional[str]:
+        closest_label = None
+        closest_z = float("inf")
+
+        for det in detections_message.detections:
+            z = det.spatialCoordinates.z
+            if z <= 0:
+                continue
+            if det.confidence < 0.5:
+                continue
+            if z < closest_z:
+                closest_z = z
+                closest_label = self._label_name(det.label)
+
+        return closest_label
+
+    def _compose_message(self, candidate: str, hazard_label: Optional[str]) -> str:
+        base = self.COMMAND_TEXT[candidate]
+
+        if hazard_label is None:
+            return base
+
+        if candidate == "STOP":
+            return f"Stop. {hazard_label} ahead."
+        if candidate == "WAIT":
+            return f"Wait. {hazard_label} ahead."
+        if candidate == "STEP_LEFT":
+            return f"Step left. {hazard_label} ahead."
+        if candidate == "STEP_RIGHT":
+            return f"Step right. {hazard_label} ahead."
+        return base
 
     def _print_sample(self, frame: np.ndarray) -> None:
         H, W = frame.shape
@@ -236,17 +341,15 @@ class AssistiveAudioNode(dai.node.HostNode):
             return False
 
         if candidate == self._last_command:
-            cooldown = self.COOLDOWN_SECONDS.get(candidate, self._interval)
+            cooldown = self._cooldown_seconds.get(candidate, self._interval)
             return (now - self._last_spoken) >= cooldown
 
         last_priority = self.COMMAND_PRIORITY.get(self._last_command, 0) if self._last_command else 0
         new_priority = self.COMMAND_PRIORITY.get(candidate, 0)
 
-        # Avoid immediate downgrade after stronger command
         if new_priority < last_priority and (now - self._last_spoken) < 1.2:
             return False
 
-        # Don't flip directions too quickly
         if self._last_command == "STEP_LEFT" and candidate == "STEP_RIGHT":
             if (now - self._last_spoken) < 1.5:
                 return False
@@ -255,14 +358,13 @@ class AssistiveAudioNode(dai.node.HostNode):
             if (now - self._last_spoken) < 1.5:
                 return False
 
-        # FORWARD should only be spoken as recovery from a blocked state
         if candidate == "FORWARD":
             if self._last_command not in {"STOP", "WAIT", "STEP_LEFT", "STEP_RIGHT"}:
                 return False
 
         return True
 
-    def _debug_print(self, candidate: Optional[str], zone_metrics_map: dict) -> None:
+    def _debug_print(self, candidate: Optional[str], zone_metrics_map: dict, confidence: str) -> None:
         top = zone_metrics_map["cone_top"].dist_mm
         mid = zone_metrics_map["cone_mid"].dist_mm
         bot = zone_metrics_map["cone_bot"].dist_mm
@@ -273,6 +375,7 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         print(
             "\r"
+            f"mode={self._mode} "
             f"top={top/1000:.1f}m "
             f"mid={mid/1000:.1f}m "
             f"bot={bot/1000:.1f}m "
@@ -281,6 +384,7 @@ class AssistiveAudioNode(dai.node.HostNode):
             f"occL={occ_l:.2f} "
             f"occR={occ_r:.2f} "
             f"state={self._last_state} "
+            f"conf={confidence} "
             f"cand={candidate or '-'} "
             f"last={self._last_command or '-'}     ",
             end="",
@@ -295,22 +399,22 @@ class AssistiveAudioNode(dai.node.HostNode):
         n_rows = strip.shape[0]
 
         row_med = np.zeros(n_rows)
-        row_ok  = np.zeros(n_rows, dtype=bool)
+        row_ok = np.zeros(n_rows, dtype=bool)
         min_valid = max(3, strip.shape[1] // 5)
         for i, row in enumerate(strip):
             v = row[row > 0]
             if len(v) >= min_valid:
                 row_med[i] = np.median(v)
-                row_ok[i]  = True
+                row_ok[i] = True
 
         if row_ok.sum() < n_rows // 2:
             return None
 
-        xs     = np.where(row_ok)[0]
+        xs = np.where(row_ok)[0]
         filled = np.interp(np.arange(n_rows), xs, row_med[xs])
-        k      = max(3, n_rows // 8)
+        k = max(3, n_rows // 8)
         smoothed = np.convolve(filled, np.ones(k) / k, mode="valid")
-        diffs    = np.diff(smoothed)
+        diffs = np.diff(smoothed)
 
         if diffs.max() > 600:
             return "stairs_down"
@@ -336,7 +440,7 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         try:
             self._tts_proc = subprocess.Popen(
-                ["espeak-ng", "-s", "150", text],
+                ["espeak-ng", "-s", "145", text],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
