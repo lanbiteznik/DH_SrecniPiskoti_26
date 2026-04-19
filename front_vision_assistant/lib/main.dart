@@ -57,7 +57,7 @@ class _VisionScreenState extends State<VisionScreen> {
   String _lastQueuedPhrase = '';
   int _lastQueuedMs = 0;
 
-  static const _wsUrl = 'ws://localhost:8001/ws';
+  String get _wsUrl => AppConfig.websocketUrl;
 
   // ── lifecycle ─────────────────────────────────────────────
 
