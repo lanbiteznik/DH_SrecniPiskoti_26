@@ -23,7 +23,7 @@ _ENV_PATH = os.path.join(os.path.dirname(__file__), "../front_vision_assistant/.
 _env = _load_env(_ENV_PATH)
 
 API_KEY = _env.get("ELEVENLABS_API_KEY", "")
-VOICE_ID = _env.get("ELEVENLABS_VOICE_ID", "EXAVITQu4EsNXjluf0k5")
+VOICE_ID = _env.get("ELEVENLABS_VOICE_ID", "l4Coq6695JDX9xtLqXDE")
 
 
 class ElevenLabsTTS:
