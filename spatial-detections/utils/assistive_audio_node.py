@@ -130,14 +130,14 @@ class AssistiveAudioNode(dai.node.HostNode):
         smoothed = np.convolve(filled, np.ones(k) / k, mode="valid")
         diffs    = np.diff(smoothed)
 
-        # Descent: floor depth suddenly jumps UP (step edge, floor drops away)
+        # Ascent: floor depth suddenly jumps UP going down the strip
         if diffs.max() > 600:
-            return "stairs_down"
+            return "stairs_up"
 
-        # Ascent: 2+ discrete downward depth jumps (stair treads visible)
+        # Descent: 2+ discrete downward depth jumps (step treads dropping away)
         neg_jumps = diffs[diffs < -250]
         if len(neg_jumps) >= 2 and abs(neg_jumps.sum()) > 500:
-            return "stairs_up"
+            return "stairs_down"
 
         return None
 
