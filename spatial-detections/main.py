@@ -1,11 +1,28 @@
+import os
+import sys
+import time
+
 import depthai as dai
 from depthai_nodes.node import ApplyColormap
+
+# Allow importing app/ from repo root
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from app.main import broadcast, set_navigation_service, start_in_background  # noqa: E402
+from app.models import Detection3D  # noqa: E402
+from app.navigation_service import NavigationService  # noqa: E402
 
 from utils.arguments import initialize_argparser
 from utils.annotation_node import AnnotationNode
 from utils.assistive_audio_node import AssistiveAudioNode
+from utils.detection_sink_node import DetectionSinkNode
 
 _, args = initialize_argparser()
+
+# Start WebSocket server before pipeline so clients can connect early
+_nav_service = NavigationService()
+set_navigation_service(_nav_service)
+start_in_background()
 
 visualizer = dai.RemoteConnection(httpPort=8082)
 device = dai.Device(dai.DeviceInfo(args.device)) if args.device else dai.Device()
@@ -79,6 +96,34 @@ with dai.Pipeline(device) as pipeline:
     # assistive audio — depth-based obstacle detection
     assistive_audio_node = pipeline.create(AssistiveAudioNode).build(
         depth=stereo.depth, interval=args.interval
+    )
+
+    def _on_command(command: str, zone_metrics_map: dict) -> None:
+        broadcast(_nav_service.format_obstacle_message(command, zone_metrics_map))
+
+    assistive_audio_node.on_command = _on_command
+
+    def _on_detections(detections) -> None:
+        det_list = []
+        for d in detections:
+            label = classes[d.label] if d.label < len(classes) else str(d.label)
+            det_list.append(Detection3D(
+                track_id=None,
+                label=label,
+                confidence=d.confidence,
+                x1=int(d.xmin * nn_size[0]),
+                y1=int(d.ymin * nn_size[1]),
+                x2=int(d.xmax * nn_size[0]),
+                y2=int(d.ymax * nn_size[1]),
+                x_mm=d.spatialCoordinates.x,
+                y_mm=d.spatialCoordinates.y,
+                z_mm=d.spatialCoordinates.z,
+                timestamp=time.time(),
+            ))
+        _nav_service.update_detections(det_list)
+
+    detection_sink = pipeline.create(DetectionSinkNode).build(
+        detections=nn.out, on_detections=_on_detections
     )
 
     apply_colormap = pipeline.create(ApplyColormap).build(stereo.depth)

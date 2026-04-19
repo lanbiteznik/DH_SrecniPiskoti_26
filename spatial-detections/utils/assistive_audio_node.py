@@ -1,6 +1,6 @@
 import subprocess
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import depthai as dai
 import numpy as np
@@ -80,6 +80,9 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._last_stair: Optional[str] = None
         self._last_stair_spoken: float = 0.0
 
+        # Optional callback: on_command(command: str, zone_metrics_map: dict) -> None
+        self.on_command: Optional[Callable] = None
+
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
         self.link_args(depth)
@@ -123,6 +126,11 @@ class AssistiveAudioNode(dai.node.HostNode):
                 self._last_stair_spoken = now
                 print(f"\n[AUDIO] {stair_msg}")
                 self._speak(stair_msg, priority=90)
+                if self.on_command is not None:
+                    try:
+                        self.on_command("STOP", zone_metrics_map)
+                    except Exception:
+                        pass
                 return
 
         if candidate is None:
@@ -154,6 +162,11 @@ class AssistiveAudioNode(dai.node.HostNode):
         spoken = self.COMMAND_TEXT[candidate]
         print(f"\n[AUDIO] {spoken}")
         self._speak(spoken, priority=self.COMMAND_PRIORITY[candidate])
+        if self.on_command is not None:
+            try:
+                self.on_command(candidate, zone_metrics_map)
+            except Exception:
+                pass
 
     def _print_sample(self, frame: np.ndarray) -> None:
         H, W = frame.shape
