@@ -14,6 +14,7 @@ from .zones import (
     classify,
     decide_command,
     command_confidence,
+    estimate_dynamic_thresholds,
 )
 
 # Colors: (R, G, B, A)
@@ -46,7 +47,6 @@ CONFIDENCE_COLORS = {
     "LOW": (1.0, 0.35, 0.0, 1.0),
 }
 
-# Only show zone overlays for the cone bands (not escape corridors — too cluttered)
 CONE_ZONES = ("cone_top", "cone_mid", "cone_bot")
 
 
@@ -88,6 +88,10 @@ class AnnotationNode(dai.node.HostNode):
         self._last_state = "clear"
         self._last_command: Optional[str] = None
 
+        self._prev_hazard_dist: Optional[float] = None
+        self._prev_hazard_time: Optional[float] = None
+        self._closing_speed_mm_s: float = 0.0
+
     def build(
         self,
         input_detections: dai.Node.Output,
@@ -118,6 +122,26 @@ class AnnotationNode(dai.node.HostNode):
         label = self.labels[closest.label] if 0 <= closest.label < len(self.labels) else "obstacle"
         return _clean_label(label), closest_z
 
+    def _update_closing_speed(self, hazard_dist: float, now: float) -> float:
+        if self._prev_hazard_dist is None or self._prev_hazard_time is None:
+            self._prev_hazard_dist = hazard_dist
+            self._prev_hazard_time = now
+            return self._closing_speed_mm_s
+
+        dt = now - self._prev_hazard_time
+        if dt <= 0:
+            return self._closing_speed_mm_s
+
+        raw_speed = max(0.0, (self._prev_hazard_dist - hazard_dist) / dt)
+        raw_speed = min(raw_speed, 2500.0)
+
+        alpha = 0.2
+        self._closing_speed_mm_s = alpha * raw_speed + (1.0 - alpha) * self._closing_speed_mm_s
+
+        self._prev_hazard_dist = hazard_dist
+        self._prev_hazard_time = now
+        return self._closing_speed_mm_s
+
     def process(
         self, detections_message: dai.Buffer, depth_message: dai.ImgFrame
     ) -> None:
@@ -125,7 +149,16 @@ class AnnotationNode(dai.node.HostNode):
 
         depth_frame = depth_message.getCvFrame()
         zone_metrics_map = get_zone_metrics(depth_frame)
-        command, state = decide_command(zone_metrics_map, self._last_state)
+
+        now = time.monotonic()
+        hazard_dist = min(
+            zone_metrics_map["cone_bot"].dist_mm,
+            zone_metrics_map["cone_mid"].dist_mm,
+        )
+        closing_speed = self._update_closing_speed(hazard_dist, now)
+        dynamic = estimate_dynamic_thresholds(closing_speed, hazard_dist)
+
+        command, state = decide_command(zone_metrics_map, self._last_state, dynamic=dynamic)
         self._last_state = state
         if command:
             self._last_command = command
@@ -134,7 +167,6 @@ class AnnotationNode(dai.node.HostNode):
 
         annotation_helper = AnnotationHelper()
 
-        # Draw cone zone bands
         for name in CONE_ZONES:
             r0, r1, c0, c1 = ZONES[name]
             d = zone_metrics_map[name].dist_mm
@@ -154,7 +186,6 @@ class AnnotationNode(dai.node.HostNode):
                 color=outline,
             )
 
-        # Draw overall cone
         annotation_helper.draw_polyline(
             points=[CONE_TL, CONE_TR, CONE_BR, CONE_BL],
             outline_color=CONE_OUTLINE,
@@ -163,7 +194,6 @@ class AnnotationNode(dai.node.HostNode):
             closed=True,
         )
 
-        # Draw escape corridors
         for side in ("left", "right"):
             r0, r1, c0, c1 = ZONES[side]
             d = zone_metrics_map[side].dist_mm
@@ -183,7 +213,6 @@ class AnnotationNode(dai.node.HostNode):
                 color=outline,
             )
 
-        # Command/status banner
         annotation_helper.draw_text(
             text=f"STATE: {state.upper()}",
             position=(0.03, 0.04),
@@ -213,18 +242,39 @@ class AnnotationNode(dai.node.HostNode):
             color=SECONDARY_COLOR,
         )
 
+        annotation_helper.draw_text(
+            text=f"SPEED: {dynamic.closing_speed_mm_s/1000:.2f} m/s",
+            position=(0.03, 0.24),
+            size=14,
+            color=SECONDARY_COLOR,
+        )
+
+        ttc_text = "inf" if dynamic.ttc_s == float("inf") else f"{dynamic.ttc_s:.1f}s"
+        annotation_helper.draw_text(
+            text=f"TTC: {ttc_text}",
+            position=(0.03, 0.29),
+            size=14,
+            color=SECONDARY_COLOR,
+        )
+
+        annotation_helper.draw_text(
+            text=f"WARN: {dynamic.warn_mm/1000:.1f}m  STOP: {dynamic.danger_mm/1000:.1f}m",
+            position=(0.03, 0.34),
+            size=13,
+            color=SECONDARY_COLOR,
+        )
+
         detections_list: List[dai.SpatialImgDetection] = detections_message.detections
         closest_info = self._closest_detection_label(detections_list)
         if closest_info:
             label, z = closest_info
             annotation_helper.draw_text(
                 text=f"HAZARD: {label.upper()} ({z/1000:.1f}m)",
-                position=(0.03, 0.24),
+                position=(0.03, 0.39),
                 size=14,
                 color=SECONDARY_COLOR,
             )
 
-        # Draw detections
         for detection in detections_list:
             xmin, ymin, xmax, ymax = (
                 detection.xmin,
