@@ -3,7 +3,7 @@ from typing import Optional
 
 import numpy as np
 
-# Thresholds in mm
+# Base thresholds in mm
 DANGER_MM = 800
 WARN_MM = 1500
 CLEAR_MM = 2000
@@ -52,6 +52,16 @@ class ZoneMetrics:
     valid_count: int
 
 
+@dataclass
+class DynamicThresholds:
+    warn_mm: float
+    danger_mm: float
+    bottom_warn_mm: float
+    bottom_danger_mm: float
+    closing_speed_mm_s: float
+    ttc_s: float
+
+
 def zone_dist(frame: np.ndarray, r0: float, r1: float, c0: float, c1: float) -> float:
     H, W = frame.shape
     roi = frame[int(r0 * H):int(r1 * H), int(c0 * W):int(c1 * W)]
@@ -96,10 +106,10 @@ def get_zone_metrics(frame: np.ndarray) -> dict[str, ZoneMetrics]:
     }
 
 
-def classify(dist: float) -> str:
-    if dist <= DANGER_MM:
+def classify(dist: float, danger_mm: float = DANGER_MM, warn_mm: float = WARN_MM) -> str:
+    if dist <= danger_mm:
         return "danger"
-    if dist <= WARN_MM:
+    if dist <= warn_mm:
         return "warn"
     return "clear"
 
@@ -109,23 +119,32 @@ def classify_with_hysteresis(
     cone_mid: float,
     cone_bot: float,
     previous: str,
+    dynamic: Optional[DynamicThresholds] = None,
 ) -> str:
+    danger_enter = dynamic.danger_mm if dynamic else DANGER_ENTER_MM
+    danger_exit = max(DANGER_EXIT_MM, danger_enter + 200)
+    warn_enter = dynamic.warn_mm if dynamic else WARN_ENTER_MM
+    warn_exit = max(WARN_EXIT_MM, warn_enter + 250)
+
+    bottom_danger = dynamic.bottom_danger_mm if dynamic else BOTTOM_DANGER_MM
+    bottom_warn = dynamic.bottom_warn_mm if dynamic else BOTTOM_WARN_MM
+
     if previous == "danger":
-        if cone_bot > BOTTOM_DANGER_MM and min(cone_mid, cone_top) > DANGER_EXIT_MM:
+        if cone_bot > bottom_danger and min(cone_mid, cone_top) > danger_exit:
             previous = "warn"
         else:
             return "danger"
 
     if previous == "warn":
-        if cone_bot <= BOTTOM_DANGER_MM or min(cone_mid, cone_top) <= DANGER_ENTER_MM:
+        if cone_bot <= bottom_danger or min(cone_mid, cone_top) <= danger_enter:
             return "danger"
-        if cone_bot > BOTTOM_WARN_MM and min(cone_mid, cone_top) > WARN_EXIT_MM:
+        if cone_bot > bottom_warn and min(cone_mid, cone_top) > warn_exit:
             return "clear"
         return "warn"
 
-    if cone_bot <= BOTTOM_DANGER_MM or min(cone_mid, cone_top) <= DANGER_ENTER_MM:
+    if cone_bot <= bottom_danger or min(cone_mid, cone_top) <= danger_enter:
         return "danger"
-    if cone_bot <= BOTTOM_WARN_MM or min(cone_mid, cone_top) <= WARN_ENTER_MM:
+    if cone_bot <= bottom_warn or min(cone_mid, cone_top) <= warn_enter:
         return "warn"
     return "clear"
 
@@ -161,9 +180,48 @@ def pick_escape_or_stop(
     return "STOP" if strong else "WAIT"
 
 
+def estimate_dynamic_thresholds(
+    closing_speed_mm_s: float,
+    hazard_dist_mm: float,
+) -> DynamicThresholds:
+    """
+    Expand thresholds based on closing speed.
+    Uses both:
+    - dynamic distance buffer = speed * reaction_time
+    - time-to-collision estimate
+    """
+
+    speed = max(0.0, min(closing_speed_mm_s, 2500.0))
+
+    warn_reaction_s = 1.2
+    danger_reaction_s = 0.55
+    bottom_warn_reaction_s = 0.9
+    bottom_danger_reaction_s = 0.45
+
+    warn_mm = min(3200.0, WARN_MM + speed * warn_reaction_s)
+    danger_mm = min(1800.0, DANGER_MM + speed * danger_reaction_s)
+    bottom_warn_mm = min(2600.0, BOTTOM_WARN_MM + speed * bottom_warn_reaction_s)
+    bottom_danger_mm = min(1500.0, BOTTOM_DANGER_MM + speed * bottom_danger_reaction_s)
+
+    if speed > 100.0:
+        ttc_s = hazard_dist_mm / speed
+    else:
+        ttc_s = float("inf")
+
+    return DynamicThresholds(
+        warn_mm=warn_mm,
+        danger_mm=danger_mm,
+        bottom_warn_mm=bottom_warn_mm,
+        bottom_danger_mm=bottom_danger_mm,
+        closing_speed_mm_s=speed,
+        ttc_s=ttc_s,
+    )
+
+
 def decide_command(
     zone_metrics_map: dict[str, ZoneMetrics],
     previous_state: str = "clear",
+    dynamic: Optional[DynamicThresholds] = None,
 ) -> tuple[Optional[str], str]:
     cone_top = zone_metrics_map["cone_top"].dist_mm
     cone_mid = zone_metrics_map["cone_mid"].dist_mm
@@ -172,20 +230,34 @@ def decide_command(
     left = zone_metrics_map["left"].dist_mm
     right = zone_metrics_map["right"].dist_mm
 
-    left_blocked = zone_is_blocked(zone_metrics_map["left"], WARN_MM)
-    right_blocked = zone_is_blocked(zone_metrics_map["right"], WARN_MM)
+    warn_mm = dynamic.warn_mm if dynamic else WARN_MM
+    danger_mm = dynamic.danger_mm if dynamic else DANGER_MM
+    bottom_warn_mm = dynamic.bottom_warn_mm if dynamic else BOTTOM_WARN_MM
+    bottom_danger_mm = dynamic.bottom_danger_mm if dynamic else BOTTOM_DANGER_MM
 
-    state = classify_with_hysteresis(cone_top, cone_mid, cone_bot, previous_state)
+    left_blocked = zone_is_blocked(zone_metrics_map["left"], warn_mm)
+    right_blocked = zone_is_blocked(zone_metrics_map["right"], warn_mm)
 
-    if cone_bot <= BOTTOM_DANGER_MM or (
-        cone_mid <= DANGER_ENTER_MM and cone_bot <= DANGER_EXIT_MM
+    state = classify_with_hysteresis(
+        cone_top, cone_mid, cone_bot, previous_state, dynamic=dynamic
+    )
+
+    # Emergency handling
+    if cone_bot <= bottom_danger_mm or (
+        cone_mid <= danger_mm and cone_bot <= max(bottom_danger_mm, danger_mm + 150)
     ):
+        return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=True), state
+
+    if dynamic and dynamic.ttc_s < 0.9:
         return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=True), state
 
     if state == "danger":
         return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=True), state
 
     if state == "warn":
+        return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=False), state
+
+    if dynamic and dynamic.ttc_s < 1.8:
         return pick_escape_or_stop(left, right, left_blocked, right_blocked, strong=False), state
 
     if cone_top > CLEAR_MM and cone_mid > CLEAR_MM and cone_bot > CLEAR_MM:

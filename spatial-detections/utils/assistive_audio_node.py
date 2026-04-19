@@ -10,6 +10,7 @@ from .zones import (
     get_zone_metrics,
     decide_command,
     command_confidence,
+    estimate_dynamic_thresholds,
     SIDE_MARGIN_MM,
 )
 
@@ -108,10 +109,12 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         self._history: list[tuple[float, str, str]] = []
 
-        # WebSocket bridge (set after build)
         self._ws: Optional["WebSocketBridge"] = None
-        # Recent detections for search queries: label → (distance_m, direction, timestamp)
         self._recent_detections: dict[str, tuple[float, str, float]] = {}
+
+        self._prev_hazard_dist: Optional[float] = None
+        self._prev_hazard_time: Optional[float] = None
+        self._closing_speed_mm_s: float = 0.0
 
     def build(
         self,
@@ -168,20 +171,29 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         zone_metrics_map = get_zone_metrics(frame)
 
-        # Smooth only distances for calmer audio
         for name, metrics in zone_metrics_map.items():
             metrics.dist_mm = self._smooth_distance(name, metrics.dist_mm)
 
         self._update_recent_detections(detections_message)
 
-        candidate, state = decide_command(zone_metrics_map, self._last_state)
+        now = time.monotonic()
+        hazard_dist = min(
+            zone_metrics_map["cone_bot"].dist_mm,
+            zone_metrics_map["cone_mid"].dist_mm,
+        )
+        closing_speed = self._update_closing_speed(hazard_dist, now)
+        dynamic = estimate_dynamic_thresholds(closing_speed, hazard_dist)
+
+        candidate, state = decide_command(
+            zone_metrics_map,
+            self._last_state,
+            dynamic=dynamic,
+        )
         self._last_state = state
         confidence = command_confidence(zone_metrics_map, candidate)
-        now = time.monotonic()
 
-        self._debug_print(candidate, zone_metrics_map, confidence)
+        self._debug_print(candidate, zone_metrics_map, confidence, dynamic)
 
-        # Stair detection gets high priority
         stair = self._detect_stairs(frame)
         stair_changed = stair != self._last_stair
         stair_repeat = stair is not None and now - self._last_stair_spoken > 3.0
@@ -228,7 +240,7 @@ class AssistiveAudioNode(dai.node.HostNode):
         if confidence in {"HIGH", "MED"}:
             hazard_label = self._get_primary_hazard_label(detections_message)
 
-        spoken = self._compose_message(candidate, hazard_label)
+        spoken = self._compose_message(candidate, hazard_label, dynamic)
 
         self._last_command = candidate
         self._last_spoken = now
@@ -267,14 +279,19 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         return closest_label
 
-    def _compose_message(self, candidate: str, hazard_label: Optional[str]) -> str:
+    def _compose_message(self, candidate: str, hazard_label: Optional[str], dynamic) -> str:
         base = self.COMMAND_TEXT[candidate]
 
+        # Optional speed-aware softening in narration
+        fast_approach = dynamic.ttc_s < 1.2 or dynamic.closing_speed_mm_s > 900
+
         if hazard_label is None:
+            if candidate == "STOP" and fast_approach:
+                return "Stop now."
             return base
 
         if candidate == "STOP":
-            return f"Stop. {hazard_label} ahead."
+            return f"Stop now. {hazard_label} ahead." if fast_approach else f"Stop. {hazard_label} ahead."
         if candidate == "WAIT":
             return f"Wait. {hazard_label} ahead."
         if candidate == "STEP_LEFT":
@@ -324,6 +341,26 @@ class AssistiveAudioNode(dai.node.HostNode):
         )
         self._smoothed_dists[zone] = smoothed_value
         return smoothed_value
+
+    def _update_closing_speed(self, hazard_dist: float, now: float) -> float:
+        if self._prev_hazard_dist is None or self._prev_hazard_time is None:
+            self._prev_hazard_dist = hazard_dist
+            self._prev_hazard_time = now
+            return self._closing_speed_mm_s
+
+        dt = now - self._prev_hazard_time
+        if dt <= 0:
+            return self._closing_speed_mm_s
+
+        raw_speed = max(0.0, (self._prev_hazard_dist - hazard_dist) / dt)
+        raw_speed = min(raw_speed, 2500.0)
+
+        alpha = 0.2
+        self._closing_speed_mm_s = alpha * raw_speed + (1.0 - alpha) * self._closing_speed_mm_s
+
+        self._prev_hazard_dist = hazard_dist
+        self._prev_hazard_time = now
+        return self._closing_speed_mm_s
 
     def _apply_direction_stickiness(
         self,
@@ -387,7 +424,7 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         return True
 
-    def _debug_print(self, candidate: Optional[str], zone_metrics_map: dict, confidence: str) -> None:
+    def _debug_print(self, candidate: Optional[str], zone_metrics_map: dict, confidence: str, dynamic) -> None:
         top = zone_metrics_map["cone_top"].dist_mm
         mid = zone_metrics_map["cone_mid"].dist_mm
         bot = zone_metrics_map["cone_bot"].dist_mm
@@ -395,6 +432,7 @@ class AssistiveAudioNode(dai.node.HostNode):
         right = zone_metrics_map["right"].dist_mm
         occ_l = zone_metrics_map["left"].occupied_ratio
         occ_r = zone_metrics_map["right"].occupied_ratio
+        ttc_text = "inf" if dynamic.ttc_s == float("inf") else f"{dynamic.ttc_s:.1f}"
 
         print(
             "\r"
@@ -406,6 +444,10 @@ class AssistiveAudioNode(dai.node.HostNode):
             f"right={right/1000:.1f}m "
             f"occL={occ_l:.2f} "
             f"occR={occ_r:.2f} "
+            f"spd={dynamic.closing_speed_mm_s/1000:.2f}m/s "
+            f"ttc={ttc_text}s "
+            f"warn={dynamic.warn_mm/1000:.1f}m "
+            f"stop={dynamic.danger_mm/1000:.1f}m "
             f"state={self._last_state} "
             f"conf={confidence} "
             f"cand={candidate or '-'} "
