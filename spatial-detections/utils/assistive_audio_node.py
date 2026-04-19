@@ -5,17 +5,76 @@ from typing import Optional
 import depthai as dai
 import numpy as np
 
-from .zones import ZONES, DANGER_MM, WARN_MM, CLEAR_MM, zone_dist, classify
+from .zones import (
+    ZONES,
+    get_zone_metrics,
+    decide_command,
+    SIDE_MARGIN_MM,
+    SIDE_STRONG_MARGIN_MM,
+)
 
 
 class AssistiveAudioNode(dai.node.HostNode):
+    # Extra margin required to flip direction shortly after speaking
+    DIRECTION_FLIP_EXTRA_MARGIN_MM = 400
+
+    # Candidate command persistence before speaking
+    CONFIRM_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 0.35,
+        "STEP_RIGHT": 0.35,
+        "WAIT": 0.50,
+        "FORWARD": 0.80,
+    }
+
+    # Speech cooldowns
+    COOLDOWN_SECONDS = {
+        "STOP": 0.0,
+        "STEP_LEFT": 1.5,
+        "STEP_RIGHT": 1.5,
+        "WAIT": 2.0,
+        "FORWARD": 3.0,
+    }
+
+    # Spoken phrases
+    COMMAND_TEXT = {
+        "STOP": "Stop.",
+        "STEP_LEFT": "Step left.",
+        "STEP_RIGHT": "Step right.",
+        "WAIT": "Wait.",
+        "FORWARD": "Forward.",
+    }
+
+    # Command priorities (higher = more important)
+    COMMAND_PRIORITY = {
+        "STOP": 100,
+        "STEP_LEFT": 70,
+        "STEP_RIGHT": 70,
+        "WAIT": 50,
+        "FORWARD": 10,
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self.input_depth = self.createInput()
-        self._interval   = 2.0
-        self._last_state = "clear"
-        self._last_spoken: float = 0.0
+
+        self._interval = 2.0
         self._tts_proc = None
+        self._tts_priority = 0
+
+        self._smoothing_alpha = 0.25
+        self._smoothed_dists: dict[str, float] = {}
+
+        self._last_state = "clear"
+        self._last_command: Optional[str] = None
+        self._last_spoken: float = 0.0
+
+        self._candidate_command: Optional[str] = None
+        self._candidate_since: float = 0.0
+
+        # Anti-spam controls
+        self._refractory_until: float = 0.0
+        self._last_nonstop_command: Optional[str] = None
 
     def build(self, depth: dai.Node.Output, interval: float = 2.0) -> "AssistiveAudioNode":
         self._interval = interval
@@ -24,39 +83,55 @@ class AssistiveAudioNode(dai.node.HostNode):
 
     def process(self, depth_message: dai.ImgFrame) -> None:
         frame = depth_message.getCvFrame()
-        if not frame.any():
+        if frame is None or not frame.any():
             return
 
         if not hasattr(self, "_sample_printed"):
             self._sample_printed = True
             self._print_sample(frame)
 
-        dists = {name: zone_dist(frame, *fracs) for name, fracs in ZONES.items()}
-        cone_dist = min(dists["cone_top"], dists["cone_mid"], dists["cone_bot"])
+        zone_metrics_map = get_zone_metrics(frame)
 
-        print(
-            f"\r  cone={cone_dist/1000:.1f}m"
-            f"  left={dists['left']/1000:.1f}m  right={dists['right']/1000:.1f}m   ",
-            end="", flush=True,
-        )
+        # Apply smoothing to distances only for audio behavior
+        for name, metrics in zone_metrics_map.items():
+            smoothed = self._smooth_distance(name, metrics.dist_mm)
+            metrics.dist_mm = smoothed
 
-        new_state = classify(cone_dist)
+        candidate, state = decide_command(zone_metrics_map, self._last_state)
+        self._last_state = state
         now = time.monotonic()
 
-        state_changed = new_state != self._last_state
-        repeat_alert  = new_state != "clear" and now - self._last_spoken > self._interval
+        self._debug_print(candidate, zone_metrics_map)
 
-        if not (state_changed or repeat_alert):
+        if candidate is None:
+            self._candidate_command = None
             return
 
-        self._last_state = new_state
-        msg = self._build_message(new_state, cone_dist, dists)
-        if msg is None:
+        # Apply direction stickiness before persistence/speech gating
+        candidate = self._apply_direction_stickiness(candidate, zone_metrics_map, now)
+
+        if candidate != self._candidate_command:
+            self._candidate_command = candidate
+            self._candidate_since = now
             return
 
+        confirm_seconds = self.CONFIRM_SECONDS.get(candidate, 0.4)
+        if now - self._candidate_since < confirm_seconds:
+            return
+
+        if not self._should_speak(candidate, now):
+            return
+
+        self._last_command = candidate
         self._last_spoken = now
-        print(f"\n[AUDIO] {msg}")
-        self._speak(msg)
+
+        if candidate != "STOP":
+            self._last_nonstop_command = candidate
+            self._refractory_until = now + 1.2
+
+        spoken = self.COMMAND_TEXT[candidate]
+        print(f"\n[AUDIO] {spoken}")
+        self._speak(spoken, priority=self.COMMAND_PRIORITY[candidate])
 
     def _print_sample(self, frame: np.ndarray) -> None:
         H, W = frame.shape
@@ -72,50 +147,143 @@ class AssistiveAudioNode(dai.node.HostNode):
         for row in grid:
             print("  " + "  ".join(f"{v:5d}" if v > 0 else "    0" for v in row))
         print()
-        print("Zone stats (15th pct / median / valid%):")
-        for name, (r0, r1, c0, c1) in ZONES.items():
-            roi = frame[int(r0*H):int(r1*H), int(c0*W):int(c1*W)]
-            v = roi[roi > 0]
-            if len(v):
-                print(f"  {name:9s}: p15={int(np.percentile(v,15)):5d}mm  "
-                      f"median={int(np.median(v)):5d}mm  valid={100*len(v)/roi.size:.0f}%")
+        print("Zone stats (p15 / median / valid% / occ%):")
+        zone_metrics_map = get_zone_metrics(frame)
+        for name in ZONES.keys():
+            m = zone_metrics_map[name]
+            if m.valid_count > 0:
+                print(
+                    f"  {name:9s}: p15={int(m.dist_mm):5d}mm  "
+                    f"median={int(m.median_mm):5d}mm  "
+                    f"valid={100*m.valid_ratio:.0f}%  "
+                    f"occ={100*m.occupied_ratio:.0f}%"
+                )
             else:
                 print(f"  {name:9s}: no valid pixels")
         print(f"{'='*60}\n")
 
-    def _build_message(self, state: str, cone_dist: float, dists: dict) -> Optional[str]:
-        if state == "clear":
-            return None
+    def _smooth_distance(self, zone: str, new_value: float) -> float:
+        previous_value = self._smoothed_dists.get(zone)
+        if previous_value is None:
+            self._smoothed_dists[zone] = new_value
+            return new_value
 
-        direction = self._escape_direction(dists["left"], dists["right"])
-        dist_m = cone_dist / 1000
+        smoothed_value = (
+            self._smoothing_alpha * new_value
+            + (1.0 - self._smoothing_alpha) * previous_value
+        )
+        self._smoothed_dists[zone] = smoothed_value
+        return smoothed_value
 
-        if state == "danger":
-            return f"Stop. Obstacle {dist_m:.1f} meters. {direction}."
-        return f"Obstacle {dist_m:.1f} meters ahead. {direction}."
+    def _apply_direction_stickiness(
+        self,
+        candidate: str,
+        zone_metrics_map: dict,
+        now: float,
+    ) -> str:
+        if candidate not in {"STEP_LEFT", "STEP_RIGHT"}:
+            return candidate
 
-    def _escape_direction(self, left_dist: float, right_dist: float) -> str:
-        margin = 400
-        left_clear  = left_dist  > WARN_MM
-        right_clear = right_dist > WARN_MM
-        if left_clear and (not right_clear or left_dist > right_dist + margin):
-            return "Move left"
-        if right_clear and (not left_clear or right_dist > left_dist + margin):
-            return "Move right"
-        if left_dist > right_dist + margin:
-            return "Move left"
-        if right_dist > left_dist + margin:
-            return "Move right"
-        return "No clear path"
+        recent_direction = (
+            self._last_command in {"STEP_LEFT", "STEP_RIGHT"}
+            and (now - self._last_spoken) < 1.5
+        )
+        if not recent_direction:
+            return candidate
 
-    def _speak(self, text: str) -> None:
-        if self._tts_proc and self._tts_proc.poll() is None:
-            self._tts_proc.terminate()
+        left_dist = zone_metrics_map["left"].dist_mm
+        right_dist = zone_metrics_map["right"].dist_mm
+
+        if self._last_command == "STEP_LEFT" and candidate == "STEP_RIGHT":
+            required = SIDE_MARGIN_MM + self.DIRECTION_FLIP_EXTRA_MARGIN_MM
+            if right_dist <= left_dist + required:
+                return "STEP_LEFT"
+
+        if self._last_command == "STEP_RIGHT" and candidate == "STEP_LEFT":
+            required = SIDE_MARGIN_MM + self.DIRECTION_FLIP_EXTRA_MARGIN_MM
+            if left_dist <= right_dist + required:
+                return "STEP_RIGHT"
+
+        return candidate
+
+    def _should_speak(self, candidate: str, now: float) -> bool:
+        if candidate == "STOP":
+            return True
+
+        if now < self._refractory_until:
+            return False
+
+        if candidate == self._last_command:
+            cooldown = self.COOLDOWN_SECONDS.get(candidate, self._interval)
+            return (now - self._last_spoken) >= cooldown
+
+        last_priority = self.COMMAND_PRIORITY.get(self._last_command, 0) if self._last_command else 0
+        new_priority = self.COMMAND_PRIORITY.get(candidate, 0)
+
+        # Avoid immediate downgrade after stronger command
+        if new_priority < last_priority and (now - self._last_spoken) < 1.2:
+            return False
+
+        # Don't flip directions too quickly
+        if self._last_command == "STEP_LEFT" and candidate == "STEP_RIGHT":
+            if (now - self._last_spoken) < 1.5:
+                return False
+
+        if self._last_command == "STEP_RIGHT" and candidate == "STEP_LEFT":
+            if (now - self._last_spoken) < 1.5:
+                return False
+
+        # FORWARD should only be spoken as recovery from a blocked state
+        if candidate == "FORWARD":
+            if self._last_command not in {"STOP", "WAIT", "STEP_LEFT", "STEP_RIGHT"}:
+                return False
+
+        return True
+
+    def _debug_print(self, candidate: Optional[str], zone_metrics_map: dict) -> None:
+        top = zone_metrics_map["cone_top"].dist_mm
+        mid = zone_metrics_map["cone_mid"].dist_mm
+        bot = zone_metrics_map["cone_bot"].dist_mm
+        left = zone_metrics_map["left"].dist_mm
+        right = zone_metrics_map["right"].dist_mm
+        occ_l = zone_metrics_map["left"].occupied_ratio
+        occ_r = zone_metrics_map["right"].occupied_ratio
+
+        print(
+            "\r"
+            f"top={top/1000:.1f}m "
+            f"mid={mid/1000:.1f}m "
+            f"bot={bot/1000:.1f}m "
+            f"left={left/1000:.1f}m "
+            f"right={right/1000:.1f}m "
+            f"occL={occ_l:.2f} "
+            f"occR={occ_r:.2f} "
+            f"state={self._last_state} "
+            f"cand={candidate or '-'} "
+            f"last={self._last_command or '-'}     ",
+            end="",
+            flush=True,
+        )
+
+    def _speak(self, text: str, priority: int = 0) -> None:
+        current_running = self._tts_proc and self._tts_proc.poll() is None
+
+        if current_running:
+            current_priority = getattr(self, "_tts_priority", 0)
+            if priority > current_priority:
+                try:
+                    self._tts_proc.terminate()
+                except Exception:
+                    pass
+            else:
+                return
+
         try:
             self._tts_proc = subprocess.Popen(
                 ["espeak-ng", "-s", "150", text],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._tts_priority = priority
         except FileNotFoundError:
             print("[WARN] espeak-ng not found. Install: sudo pacman -S espeak-ng")
