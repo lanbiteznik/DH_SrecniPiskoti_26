@@ -5,8 +5,14 @@ from typing import List
 import cv2
 
 from .zones import (
-    ZONES, CONE_TL, CONE_TR, CONE_BR, CONE_BL,
-    DANGER_MM, WARN_MM, zone_dist, classify,
+    ZONES,
+    CONE_TL,
+    CONE_TR,
+    CONE_BR,
+    CONE_BL,
+    get_zone_metrics,
+    classify,
+    decide_command,
 )
 
 # Colors: (R, G, B, A)
@@ -25,6 +31,14 @@ STATE_COLORS = {
     "clear":  (CLEAR_OUTLINE,  CLEAR_FILL),
 }
 
+COMMAND_TEXT = {
+    "STOP": "STOP",
+    "STEP_LEFT": "STEP LEFT",
+    "STEP_RIGHT": "STEP RIGHT",
+    "WAIT": "WAIT",
+    "FORWARD": "FORWARD",
+}
+
 # Only show zone overlays for the cone bands (not escape corridors — too cluttered)
 CONE_ZONES = ("cone_top", "cone_mid", "cone_bot")
 
@@ -34,7 +48,7 @@ def _in_cone(cx: float, cy: float) -> bool:
     if not (r0 <= cy <= r1):
         return False
     t = (cy - r0) / (r1 - r0)
-    left  = CONE_TL[0] + t * (CONE_BL[0] - CONE_TL[0])
+    left = CONE_TL[0] + t * (CONE_BL[0] - CONE_TL[0])
     right = CONE_TR[0] + t * (CONE_BR[0] - CONE_TR[0])
     return left <= cx <= right
 
@@ -54,6 +68,7 @@ class AnnotationNode(dai.node.HostNode):
             ]
         )
         self.labels = []
+        self._last_state = "clear"
 
     def build(
         self,
@@ -71,16 +86,18 @@ class AnnotationNode(dai.node.HostNode):
         assert isinstance(detections_message, dai.SpatialImgDetections)
 
         depth_frame = depth_message.getCvFrame()
-        dists = {name: zone_dist(depth_frame, *fracs) for name, fracs in ZONES.items()}
+        zone_metrics_map = get_zone_metrics(depth_frame)
+        command, state = decide_command(zone_metrics_map, self._last_state)
+        self._last_state = state
 
         annotation_helper = AnnotationHelper()
 
         # Draw cone zone bands, colored by their danger state
         for name in CONE_ZONES:
             r0, r1, c0, c1 = ZONES[name]
-            d = dists[name]
-            state = classify(d)
-            outline, fill = STATE_COLORS[state]
+            d = zone_metrics_map[name].dist_mm
+            zone_state = classify(d)
+            outline, fill = STATE_COLORS[zone_state]
             annotation_helper.draw_rectangle(
                 top_left=(c0, r0),
                 bottom_right=(c1, r1),
@@ -107,9 +124,9 @@ class AnnotationNode(dai.node.HostNode):
         # Draw escape corridor states
         for side in ("left", "right"):
             r0, r1, c0, c1 = ZONES[side]
-            d = dists[side]
-            state = classify(d)
-            outline, fill = STATE_COLORS[state]
+            d = zone_metrics_map[side].dist_mm
+            zone_state = classify(d)
+            outline, fill = STATE_COLORS[zone_state]
             annotation_helper.draw_rectangle(
                 top_left=(c0, r0),
                 bottom_right=(c1, r1),
@@ -122,6 +139,22 @@ class AnnotationNode(dai.node.HostNode):
                 position=(c0 + 0.01, r0 + 0.04),
                 size=11,
                 color=outline,
+            )
+
+        # Command/status banner
+        annotation_helper.draw_text(
+            text=f"STATE: {state.upper()}",
+            position=(0.03, 0.04),
+            size=16,
+            color=SECONDARY_COLOR,
+        )
+
+        if command:
+            annotation_helper.draw_text(
+                text=f"CMD: {COMMAND_TEXT.get(command, command)}",
+                position=(0.03, 0.09),
+                size=18,
+                color=SECONDARY_COLOR,
             )
 
         # Draw detections — red if inside the cone, default color otherwise
@@ -143,7 +176,12 @@ class AnnotationNode(dai.node.HostNode):
                 thickness=2.0,
             )
             annotation_helper.draw_text(
-                text=f"{self.labels[detection.label]} {int(detection.confidence * 100)}% \nx: {detection.spatialCoordinates.x:.2f}mm \ny: {detection.spatialCoordinates.y:.2f}mm \nz:{detection.spatialCoordinates.z:.2f}mm",
+                text=(
+                    f"{self.labels[detection.label]} {int(detection.confidence * 100)}%\n"
+                    f"x: {detection.spatialCoordinates.x:.0f}mm\n"
+                    f"y: {detection.spatialCoordinates.y:.0f}mm\n"
+                    f"z: {detection.spatialCoordinates.z:.0f}mm"
+                ),
                 position=(xmin + 0.01, ymin + 0.2),
                 size=12,
                 color=SECONDARY_COLOR,
