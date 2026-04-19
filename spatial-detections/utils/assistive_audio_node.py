@@ -1,6 +1,6 @@
 import subprocess
 import time
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 import depthai as dai
 import numpy as np
@@ -12,6 +12,9 @@ from .zones import (
     command_confidence,
     SIDE_MARGIN_MM,
 )
+
+if TYPE_CHECKING:
+    from websocket_server import WebSocketBridge
 
 
 def _clean_label(label: str) -> str:
@@ -105,6 +108,11 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         self._history: list[tuple[float, str, str]] = []
 
+        # WebSocket bridge (set after build)
+        self._ws: Optional["WebSocketBridge"] = None
+        # Recent detections for search queries: label → (distance_m, direction, timestamp)
+        self._recent_detections: dict[str, tuple[float, str, float]] = {}
+
     def build(
         self,
         depth: dai.Node.Output,
@@ -112,10 +120,14 @@ class AssistiveAudioNode(dai.node.HostNode):
         labels: List[str],
         interval: float = 2.0,
         mode: str = "safe",
+        ws: Optional["WebSocketBridge"] = None,
     ) -> "AssistiveAudioNode":
         self._interval = interval
         self._mode = mode
         self.labels = labels
+        self._ws = ws
+        if ws is not None:
+            ws.set_search_callback(self._handle_search)
         self.link_args(depth, detections)
         return self
 
@@ -160,6 +172,8 @@ class AssistiveAudioNode(dai.node.HostNode):
         for name, metrics in zone_metrics_map.items():
             metrics.dist_mm = self._smooth_distance(name, metrics.dist_mm)
 
+        self._update_recent_detections(detections_message)
+
         candidate, state = decide_command(zone_metrics_map, self._last_state)
         self._last_state = state
         confidence = command_confidence(zone_metrics_map, candidate)
@@ -182,6 +196,14 @@ class AssistiveAudioNode(dai.node.HostNode):
                 self._last_stair_spoken = now
                 print(f"\n[AUDIO] {stair_msg}")
                 self._speak(stair_msg, priority=90)
+                if self._ws:
+                    self._ws.broadcast({
+                        "type": "obstacle",
+                        "label": "stairs",
+                        "distance": 1.0,
+                        "direction": "ahead",
+                        "urgency": "high",
+                    })
                 return
 
         if candidate is None:
@@ -220,6 +242,7 @@ class AssistiveAudioNode(dai.node.HostNode):
 
         print(f"\n[AUDIO] {spoken}")
         self._speak(spoken, priority=self.COMMAND_PRIORITY[candidate])
+        self._broadcast_obstacle(candidate, hazard_label, zone_metrics_map)
 
     def _label_name(self, label_idx: int) -> str:
         if 0 <= label_idx < len(self.labels):
@@ -424,6 +447,101 @@ class AssistiveAudioNode(dai.node.HostNode):
             return "stairs_up"
 
         return None
+
+    def _update_recent_detections(self, detections_message: dai.SpatialImgDetections) -> None:
+        now = time.monotonic()
+        for det in detections_message.detections:
+            if det.confidence < 0.4:
+                continue
+            z = det.spatialCoordinates.z
+            if z <= 0:
+                continue
+            label = self._label_name(det.label)
+            distance_m = round(z / 1000.0, 2)
+            x = det.spatialCoordinates.x
+            if x < -150:
+                direction = "to your left"
+            elif x > 150:
+                direction = "to your right"
+            else:
+                direction = "ahead"
+            self._recent_detections[label] = (distance_m, direction, now)
+
+        # Expire detections older than 5 seconds
+        self._recent_detections = {
+            k: v for k, v in self._recent_detections.items() if now - v[2] < 5.0
+        }
+
+    def _broadcast_obstacle(
+        self,
+        command: str,
+        hazard_label: Optional[str],
+        zone_metrics_map: dict,
+    ) -> None:
+        if self._ws is None:
+            return
+        if command == "FORWARD":
+            return
+
+        urgency_map = {
+            "STOP": "high",
+            "STEP_LEFT": "medium",
+            "STEP_RIGHT": "medium",
+            "WAIT": "medium",
+        }
+        direction_map = {
+            "STOP": "back",
+            "STEP_LEFT": "left",
+            "STEP_RIGHT": "right",
+            "WAIT": "ahead",
+        }
+
+        cone_dists = [
+            zone_metrics_map["cone_top"].dist_mm,
+            zone_metrics_map["cone_mid"].dist_mm,
+            zone_metrics_map["cone_bot"].dist_mm,
+        ]
+        distance_m = round(min(d for d in cone_dists if d > 0) / 1000.0, 2)
+
+        self._ws.broadcast({
+            "type": "obstacle",
+            "label": hazard_label or "obstacle",
+            "distance": distance_m,
+            "direction": direction_map.get(command, "ahead"),
+            "urgency": urgency_map.get(command, "medium"),
+        })
+
+    def _handle_search(self, query: str, ws) -> None:
+        now = time.monotonic()
+        best_label = None
+        best_dist = float("inf")
+        best_dir = "ahead"
+
+        for label, (dist_m, direction, ts) in self._recent_detections.items():
+            if now - ts > 5.0:
+                continue
+            if query in label or label in query:
+                if dist_m < best_dist:
+                    best_dist = dist_m
+                    best_label = label
+                    best_dir = direction
+
+        if best_label is not None:
+            self._ws.send_to(ws, {
+                "type": "search_result",
+                "found": True,
+                "query": query,
+                "distance": best_dist,
+                "direction": best_dir,
+            })
+            print(f"[SEARCH] '{query}' → found: {best_label} at {best_dist}m {best_dir}")
+        else:
+            self._ws.send_to(ws, {
+                "type": "search_result",
+                "found": False,
+                "query": query,
+            })
+            print(f"[SEARCH] '{query}' → not found in recent detections")
 
     def _speak(self, text: str, priority: int = 0) -> None:
         current_running = self._tts_proc and self._tts_proc.poll() is None

@@ -4,8 +4,12 @@ from depthai_nodes.node import ApplyColormap
 from utils.arguments import initialize_argparser
 from utils.annotation_node import AnnotationNode
 from utils.assistive_audio_node import AssistiveAudioNode
+from websocket_server import WebSocketBridge
 
 _, args = initialize_argparser()
+
+ws_bridge = WebSocketBridge(port=8001)
+ws_bridge.start()
 
 visualizer = dai.RemoteConnection(httpPort=8082)
 device = dai.Device(dai.DeviceInfo(args.device)) if args.device else dai.Device()
@@ -79,6 +83,7 @@ with dai.Pipeline(device) as pipeline:
         labels=classes,
         interval=args.interval,
         mode=args.mode,
+        ws=ws_bridge,
     )
 
     apply_colormap = pipeline.create(ApplyColormap).build(stereo.depth)
