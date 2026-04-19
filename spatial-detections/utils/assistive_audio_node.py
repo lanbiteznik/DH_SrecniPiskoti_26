@@ -1,9 +1,10 @@
-import subprocess
 import time
 from typing import List, Optional, TYPE_CHECKING
 
 import depthai as dai
 import numpy as np
+
+from tts_elevenlabs import ElevenLabsTTS
 
 from .zones import (
     ZONES,
@@ -88,8 +89,7 @@ class AssistiveAudioNode(dai.node.HostNode):
         self._mode = "safe"
         self.labels: List[str] = []
 
-        self._tts_proc = None
-        self._tts_priority = 0
+        self._tts = ElevenLabsTTS()
 
         self._smoothing_alpha = 0.25
         self._smoothed_dists: dict[str, float] = {}
@@ -590,24 +590,4 @@ class AssistiveAudioNode(dai.node.HostNode):
             self._speak(spoken, priority=60)
 
     def _speak(self, text: str, priority: int = 0) -> None:
-        current_running = self._tts_proc and self._tts_proc.poll() is None
-
-        if current_running:
-            current_priority = getattr(self, "_tts_priority", 0)
-            if priority > current_priority:
-                try:
-                    self._tts_proc.terminate()
-                except Exception:
-                    pass
-            else:
-                return
-
-        try:
-            self._tts_proc = subprocess.Popen(
-                ["espeak-ng", "-s", "145", text],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._tts_priority = priority
-        except FileNotFoundError:
-            print("[WARN] espeak-ng not found. Install: sudo pacman -S espeak-ng")
+        self._tts.speak(text, priority)
