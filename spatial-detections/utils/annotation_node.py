@@ -124,13 +124,13 @@ class AnnotationNode(dai.node.HostNode):
                 detection.xmax,
                 detection.ymax,
             )
-            in_cone = in_cone((xmin + xmax) / 2, (ymin + ymax) / 2)
+            detection_in_cone = in_cone((xmin + xmax) / 2, (ymin + ymax) / 2)
 
             annotation_helper.draw_rectangle(
                 top_left=(xmin, ymin),
                 bottom_right=(xmax, ymax),
-                outline_color=DANGER_OUTLINE if in_cone else PRIMARY_COLOR,
-                fill_color=DANGER_FILL if in_cone else TRANSPARENT_PRIMARY_COLOR,
+                outline_color=DANGER_OUTLINE if detection_in_cone else PRIMARY_COLOR,
+                fill_color=DANGER_FILL if detection_in_cone else TRANSPARENT_PRIMARY_COLOR,
                 thickness=2.0,
             )
             annotation_helper.draw_text(
