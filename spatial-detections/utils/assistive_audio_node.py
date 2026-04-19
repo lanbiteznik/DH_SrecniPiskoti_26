@@ -576,14 +576,18 @@ class AssistiveAudioNode(dai.node.HostNode):
                 "distance": best_dist,
                 "direction": best_dir,
             })
+            spoken = f"{best_label} found, {best_dist:.1f} meters {best_dir}"
             print(f"[SEARCH] '{query}' → found: {best_label} at {best_dist}m {best_dir}")
+            self._speak(spoken, priority=80)
         else:
             self._ws.send_to(ws, {
                 "type": "search_result",
                 "found": False,
                 "query": query,
             })
+            spoken = f"{query} not detected nearby"
             print(f"[SEARCH] '{query}' → not found in recent detections")
+            self._speak(spoken, priority=60)
 
     def _speak(self, text: str, priority: int = 0) -> None:
         current_running = self._tts_proc and self._tts_proc.poll() is None
