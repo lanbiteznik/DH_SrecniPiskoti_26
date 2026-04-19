@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'tts/tts_factory.dart';
 import 'stt_service.dart';
 import 'config.dart';
 
@@ -33,7 +32,6 @@ class VisionScreen extends StatefulWidget {
 class _VisionScreenState extends State<VisionScreen> {
   // ── services ──────────────────────────────────────────────
   late WebSocketChannel _channel;
-  final TtsService _tts = TtsService();
   final SttService _stt = SttService();
 
   // ── app state ─────────────────────────────────────────────
@@ -43,15 +41,6 @@ class _VisionScreenState extends State<VisionScreen> {
   // ── mic state ─────────────────────────────────────────────
   bool _micActive = false;
   bool _isListening = false;
-
-  // ── queue ─────────────────────────────────────────────────
-  final List<Map<String, dynamic>> _queue = [];
-  bool _queueRunning = false;
-  bool _isSpeaking = false;
-
-  // ── warning dedup ─────────────────────────────────────────
-  String _lastQueuedPhrase = '';
-  int _lastQueuedMs = 0;
 
   static String get _wsUrl => AppConfig.websocketUrl;
 
@@ -66,10 +55,8 @@ class _VisionScreenState extends State<VisionScreen> {
   Future<void> _init() async {
     try {
       await AppConfig.load();
-      await _tts.init();
       await _stt.init();
       _connect();
-      _startQueueLoop();
       if (mounted) setState(() => _status = 'Hold to search');
     } catch (e) {
       if (mounted) setState(() => _status = 'Init error: $e');
@@ -79,7 +66,6 @@ class _VisionScreenState extends State<VisionScreen> {
   @override
   void dispose() {
     _channel.sink.close();
-    _tts.stop();
     _stt.stop();
     super.dispose();
   }
@@ -111,28 +97,6 @@ class _VisionScreenState extends State<VisionScreen> {
     if (_micActive) return;
 
     final phrase = _buildWarningPhrase(data);
-    final urgency = data['urgency'] as String;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    final cooldown = urgency == 'high' ? 800 : 3000;
-    final isDuplicate =
-        phrase == _lastQueuedPhrase && (now - _lastQueuedMs) < cooldown;
-
-    if (isDuplicate) return;
-
-    _lastQueuedPhrase = phrase;
-    _lastQueuedMs = now;
-
-    if (urgency == 'high') {
-      _queue.clear();
-      _tts.stop();
-      _queue.insert(0, {'phrase': phrase, 'priority': true});
-    } else {
-      if (_queue.length < 3) {
-        _queue.add({'phrase': phrase, 'priority': false});
-      }
-    }
-
     if (mounted) setState(() => _lastDetection = phrase);
   }
 
@@ -144,56 +108,7 @@ class _VisionScreenState extends State<VisionScreen> {
         ? '$query is ${(data['distance'] as num).toStringAsFixed(1)} meters, ${data['direction']}'
         : '$query not detected nearby';
 
-    _queue.clear();
-    _tts.stop();
-    _lastQueuedPhrase = '';
-    _lastQueuedMs = 0;
-
-    _queue.insert(0, {'phrase': phrase, 'priority': true});
-
     if (mounted) setState(() => _lastDetection = phrase);
-  }
-
-  // ── queue loop ────────────────────────────────────────────
-
-  Future<void> _startQueueLoop() async {
-    if (_queueRunning) return;
-    _queueRunning = true;
-
-    while (true) {
-      try {
-        if (_micActive) {
-          await Future.delayed(const Duration(milliseconds: 50));
-          continue;
-        }
-
-        if (_queue.isEmpty) {
-          await Future.delayed(const Duration(milliseconds: 50));
-          continue;
-        }
-
-        final idx = _queue.indexWhere((d) => d['priority'] == true);
-        final item = idx != -1 ? _queue.removeAt(idx) : _queue.removeAt(0);
-        final phrase = item['phrase'] as String;
-
-        _isSpeaking = true;
-        if (mounted) setState(() {});
-
-        try {
-          await _tts.synthesizeAndPlay(phrase);
-        } catch (e) {
-          print('[QUEUE] Speak error: $e');
-        }
-
-        _isSpeaking = false;
-        if (mounted) setState(() {});
-      } catch (e) {
-        print('[QUEUE] Loop error: $e');
-        _isSpeaking = false;
-        if (mounted) setState(() {});
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
-    }
   }
 
   // ── mic ───────────────────────────────────────────────────
@@ -201,9 +116,6 @@ class _VisionScreenState extends State<VisionScreen> {
   Future<void> _onMicHold() async {
     if (_micActive) return;
     _micActive = true;
-
-    _tts.stop();
-    _queue.clear();
 
     await _stt.startListening();
     if (mounted) setState(() => _isListening = true);
@@ -218,8 +130,6 @@ class _VisionScreenState extends State<VisionScreen> {
     print('[STT] Got: $object');
 
     _micActive = false;
-    _lastQueuedPhrase = '';
-    _lastQueuedMs = 0;
 
     if (mounted) setState(() => _isListening = false);
 
@@ -268,56 +178,26 @@ class _VisionScreenState extends State<VisionScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                // Title
-                const Icon(Icons.hearing, color: Colors.white24, size: 36),
-                const SizedBox(height: 12),
+                const Icon(Icons.hearing, color: Colors.white24, size: 130),
+                const SizedBox(height: 60),
                 const Text(
                   'Vision Assistant',
                   style: TextStyle(
                     color: Colors.white38,
-                    fontSize: 18,
+                    fontSize: 40,
                     fontWeight: FontWeight.w300,
                     letterSpacing: 3,
                   ),
                 ),
-
-                const SizedBox(height: 64),
-
-                // Status dot
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 300),
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: color,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(height: 20),
-
-                // Detection text
-                Text(
-                  _lastDetection.isEmpty ? 'No detections yet' : _lastDetection,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: _lastDetection.isEmpty ? Colors.white24 : color,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w400,
-                    height: 1.6,
-                  ),
-                ),
-
-                const SizedBox(height: 72),
-
-                // Mic button
+                const SizedBox(height: 200),
                 GestureDetector(
                   onTapDown: (_) => _onMicHold(),
                   onTapUp: (_) => _onMicRelease(),
                   onTapCancel: () => _onMicRelease(),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 200),
-                    width: 80,
-                    height: 80,
+                    width: 350,
+                    height: 350,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       color: _isListening
@@ -343,14 +223,11 @@ class _VisionScreenState extends State<VisionScreen> {
                       color: _isListening || _micActive
                           ? Colors.white
                           : Colors.white38,
-                      size: 30,
+                      size: 100,
                     ),
                   ),
                 ),
-
                 const SizedBox(height: 16),
-
-                // Status label
                 Text(
                   _isListening
                       ? 'Listening...'
